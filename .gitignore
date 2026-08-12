@@ -14,3 +14,4 @@ split_prompt.md
 *.chroma_db/
 chroma_db/
 uv.lock
+template.ass
