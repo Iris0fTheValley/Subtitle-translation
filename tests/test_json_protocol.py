@@ -204,18 +204,10 @@ class JsonProtocolTests(unittest.TestCase):
                 "en": "source",
                 "zh": "",
                 "retrieved_context": [],
-                "context_before": [{"id": 6, "en": "", "zh": "上文"}],
             },
         )
 
-        self.assertEqual(
-            item.to_json_value(),
-            {
-                "id": 7,
-                "en": "source",
-                "context_before": [{"id": 6, "zh": "上文"}],
-            },
-        )
+        self.assertEqual(item.to_json_value(), {"id": 7, "en": "source"})
 
     def test_typed_translate_item_serializes_language_key(self):
         item = t.make_source_item(7, self.ctx, "source text")
@@ -246,23 +238,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.source_parts, ["a", "b"])
         self.assertEqual(result.target_parts, ["甲", "乙"])
 
-    def test_typed_split_input_serializes_context(self):
-        item = t.make_pair_item(
-            12,
-            self.ctx,
-            "current source",
-            "current target",
-            context_before=[t.make_pair_json(11, self.ctx, "before source", "before target")],
-            context_after=[t.make_pair_json(13, self.ctx, "after source", "after target")],
-        )
-
-        data = item.to_json_value()
-        self.assertEqual(data["id"], 12)
-        self.assertEqual(data["en"], "current source")
-        self.assertEqual(data["zh"], "current target")
-        self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
-        self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
-
     def test_typed_proofread_result_parses_language_values(self):
         result = t.LanguageTextResult.from_json_value(
             {"id": 3, "en": "corrected source", "zh": "corrected target"},
@@ -270,6 +245,26 @@ class JsonProtocolTests(unittest.TestCase):
         )
         self.assertEqual(result.source_text, "corrected source")
         self.assertEqual(result.target_text, "corrected target")
+
+    def test_typed_translation_result_preserves_human_review_metadata(self):
+        result = t.LanguageTextResult.from_json_value(
+            {
+                "id": 3,
+                "zh": "自然译文",
+                "review": {
+                    "needs_human": True,
+                    "categories": ["pun"],
+                    "reasons": ["双关有两种合理解释"],
+                    "alternatives": ["备选译法"],
+                    "note": "确认笑点语境",
+                },
+            },
+            self.ctx,
+            require_source=False,
+        )
+        self.assertEqual(result.target_text, "自然译文")
+        self.assertEqual(result.review["categories"], ["pun"])
+        self.assertTrue(result.review["needs_human"])
 
     def test_typed_proofread_item_serializes_retrieved_context(self):
         item = t.make_pair_item(
@@ -288,6 +283,40 @@ class JsonProtocolTests(unittest.TestCase):
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
             },
         )
+
+    def test_human_review_sidecar_contains_translation_and_proofread_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[
+                    t.TranscriptSegment(
+                        1,
+                        0.0,
+                        2.0,
+                        "source pun",
+                        translation="译文",
+                        review={"needs_human": True, "categories": ["pun"], "reasons": ["需确认双关"]},
+                        split_events=[
+                            t.SplitEvent(
+                                0.0,
+                                2.0,
+                                "source pun",
+                                "译文",
+                                {"needs_human": True, "categories": ["subtext"], "reasons": ["潜台词不确定"]},
+                            )
+                        ],
+                    )
+                ],
+            )
+            t.write_human_review_sidecar(ctx, transcript)
+            with open(ctx.review_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(payload["format"], "subtitle-human-review")
+            self.assertEqual(payload["items"][0]["translation_review"]["categories"], ["pun"])
+            self.assertEqual(payload["items"][0]["event_reviews"][0]["proofread_review"]["categories"], ["subtext"])
 
     def test_build_glossary_adds_retrieved_context(self):
         class FakeRetriever:
@@ -2794,7 +2823,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
-        template = os.path.abspath("template.ass")
+        template = os.path.join(os.path.dirname(t.__file__), "template.ass.example")
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 
         with tempfile.TemporaryDirectory() as tmp:
