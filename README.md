@@ -148,7 +148,7 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_ENHANCED` | `1/0` 显式启用证据增强校对和按需联网搜索，默认 `0`；仅设置 provider/model 不会开启联网 |
 | `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；缓存命中不消耗预算 |
 | `PROOFREAD_CONCURRENCY` | 并发校对请求数，默认 `1`；与 `PROOFREAD_BATCH_SIZE` 独立 |
-| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` | 可选的 provider 推理参数；留空不发送覆盖值，使用 provider 默认 |
+| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` | 已知支持的 provider（当前为 DeepSeek）留空自动使用 `enabled` / `high`；非空显式值始终覆盖。能力未知或不支持的 provider 不发送专用参数 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
@@ -169,7 +169,7 @@ DEEPSEEK_API_KEY=
 
 校对 safety 分为语言无关和语言专用两层：ID 完整性、时间轴不变、术语约束、sentence-group 原子性与证据冲突处理始终启用；当前语义锚点词表仅覆盖 English→Chinese，其他语言方向会显式跳过该语言专用 gate，仍保留全部通用检查。
 
-`PROOFREAD_BATCH_SIZE` 控制单次请求包含多少字幕，`PROOFREAD_CONCURRENCY` 控制同时在途的请求数，两者互不替代。默认并发为 `1`，保持串行兼容。对于明确支持 thinking / reasoning effort 的 provider，可按需设置 `PROOFREAD_THINKING=enabled` 和合适的 `PROOFREAD_REASONING_EFFORT`；更强推理通常提高疑难问题覆盖，但会增加 token、延迟和费用。留空最安全，不会向不兼容 provider 发送这些参数。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是目标修改率。
+`PROOFREAD_BATCH_SIZE` 控制单次请求包含多少字幕，`PROOFREAD_CONCURRENCY` 控制同时在途的请求数，两者互不替代。默认并发为 `1`，保持串行兼容。未开启 thinking 时，部分模型的校对会明显趋于保守，可能大幅减少实际修改覆盖；开启 thinking 可显著提高问题发现与校对覆盖，但会增加 token、延迟和费用。当前仅对已知支持这组请求参数的 DeepSeek 校对自动使用 `PROOFREAD_THINKING=enabled` 与 `PROOFREAD_REASONING_EFFORT=high`；能力未知或不支持的 provider 保持其原有默认，不发送专用参数。任一非空显式环境变量始终覆盖对应自动值。thinking/reasoning 只作用于 proofreading，不影响首译或 glossary。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是 EDIT 数量或修改率目标。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
