@@ -6319,6 +6319,11 @@ def proofread_split_events(
             # It receives the exact same RAG, sentence context, and refreshed
             # terminology constraints as the rejected candidate.
             if decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
+                retry_term_context = (
+                    relevant_term_evidence(event.en, search_runtime.sidecar)
+                    if search_runtime is not None
+                    else batch_term_context[index]
+                )
                 retry_request = LLMBatchRequest([
                     make_proofread_item(
                         item_offset + index + 1,
@@ -6329,8 +6334,8 @@ def proofread_split_events(
                         review_hint=merge_review_metadata(
                             batch_review_hints[index], normalized_review
                         ),
-                        terminology_constraints=batch_term_context[index][0],
-                        evidence_conflicts=batch_term_context[index][1],
+                        terminology_constraints=retry_term_context[0],
+                        evidence_conflicts=retry_term_context[1],
                         sentence_context=sentence_contexts[item_offset + index],
                         safety_retry={
                             "attempt": 1,
@@ -6357,7 +6362,7 @@ def proofread_split_events(
                         event.en, event.zh,
                         retry_en.strip() or event.en, retry_zh.strip() or event.zh,
                         retry_edit, merge_review_metadata(persistent_event_review(event.review), retry_review),
-                        batch_term_context[index][0], batch_term_context[index][1],
+                        retry_term_context[0], retry_term_context[1],
                         safety_mode=safety_mode_enabled, safety_events=retry_events,
                         semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
                     )
