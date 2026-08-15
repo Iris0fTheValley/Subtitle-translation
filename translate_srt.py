@@ -4696,7 +4696,20 @@ def translate_segments(
             changed = run_work_unit(work_unit) or changed
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-            changed = any(executor.map(run_work_unit, work_units))
+            futures = [executor.submit(run_work_unit, work_unit) for work_unit in work_units]
+            failures: list[BaseException] = []
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    changed = future.result() or changed
+                except BaseException as error:
+                    # Consume every submitted result before propagating an
+                    # unexpected failure.  `any(executor.map(...))` stopped
+                    # after the first changed unit and could hide later ones.
+                    failures.append(error)
+            if failures:
+                raise RuntimeError(
+                    f"{len(failures)} concurrent translation work unit(s) failed"
+                ) from failures[0]
     return changed
 
 

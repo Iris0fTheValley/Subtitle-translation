@@ -3,6 +3,7 @@ import json
 import io
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1650,6 +1651,33 @@ class JsonProtocolTests(unittest.TestCase):
         recovered_middle = next(items[0] for items in requests if len(items) == 1 and items[0]["id"] == 2)
         self.assertEqual(recovered_middle["sentence_context"]["previous"]["id"], 1)
         self.assertEqual(recovered_middle["sentence_context"]["next"]["id"], 3)
+
+    def test_translate_concurrency_consumes_all_worker_failures(self):
+        calls = []
+
+        def fake_batch(request, _session, _quiet, **_kwargs):
+            item_id = request.to_json_value()["items"][0]["id"]
+            calls.append(item_id)
+            if item_id == 1:
+                return [{"id": 1, "zh": "first"}]
+            time.sleep(0.05 if item_id == 2 else 0.1)
+            raise SystemExit("late worker failure")
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "first"),
+                t.TranscriptSegment(2, 1.0, 2.0, "second"),
+                t.TranscriptSegment(3, 2.0, 3.0, "third"),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            with self.assertRaisesRegex(RuntimeError, "2 concurrent translation work unit\\(s\\) failed"):
+                t.translate_segments(
+                    transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                    concurrency=3,
+                )
+
+        self.assertEqual(set(calls), {1, 2, 3})
 
     def test_proofread_split_events_adds_retrieved_context(self):
         class FakeRetriever:
