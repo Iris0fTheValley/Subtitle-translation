@@ -12,6 +12,7 @@ sentences back onto the timeline.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import math
@@ -2320,6 +2321,8 @@ def load_glossary(glossary_path: str) -> str:
 
 
 def load_glossary_prompt_context(glossary_path: str, retriever: EmbeddingRetriever | None) -> str:
+    # glossary.md is the resident project authority. Retrieval is useful
+    # per-item supplementary evidence, never a lossy replacement for it.
     return load_glossary(glossary_path)
 
 
@@ -4012,6 +4015,50 @@ def enrich_confirmed_term_evidence(
     )
 
 
+def enrich_candidate_asr_term_evidence(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+    candidate_pairs: list[tuple[str, str]],
+) -> WebEvidenceSidecar:
+    """Promote a verified web mapping when this candidate exposes its ASR form.
+
+    The page still has to pass the normal body/source-quality checks.  We only
+    infer the old spelling from a bounded token replacement that produced the
+    canonical source form already present in the candidate.
+    """
+    raw_terms: list[dict] = []
+    mappings = supported_web_term_mappings(
+        transcript, sidecar, require_transcript_match=False
+    )
+    for original, candidate in candidate_pairs:
+        if not original or not candidate or original == candidate:
+            continue
+        original_words = original.split()
+        candidate_words = candidate.split()
+        for mapping in mappings:
+            canonical = str(mapping.get("source", "")).strip()
+            target = str(mapping.get("target", "")).strip()
+            if not canonical or not target or not term_form_in_text(candidate, canonical):
+                continue
+            for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, original_words, candidate_words, autojunk=False
+            ).get_opcodes():
+                old = " ".join(original_words[i1:i2]).strip()
+                new = " ".join(candidate_words[j1:j2]).strip()
+                if tag in {"replace", "insert"} and old and term_form_in_text(new, canonical):
+                    raw_terms.append(
+                        {
+                            "source": canonical,
+                            "target": target,
+                            "source_variants": [old],
+                            "confidence": "confirmed",
+                            "evidence_urls": list(mapping.get("urls", [])),
+                            "note": "proofread candidate ASR replacement backed by webpage mapping",
+                        }
+                    )
+    return enrich_confirmed_term_evidence(transcript, sidecar, raw_terms)
+
+
 def transcript_from_request_fields(request_fields: dict) -> Transcript:
     text_parts = []
     for key in ("transcript", "transcript_excerpt"):
@@ -4708,6 +4755,14 @@ def semantic_anchor_regressions(
     return regressions
 
 
+def supports_en_zh_semantic_anchor_gate(ctx: TranscriptContext) -> bool:
+    """The lexical anchor catalogue is deliberately limited to English→Chinese."""
+    return (
+        ctx.source_lang_code.casefold().startswith("en")
+        and ctx.target_lang_code.casefold().startswith("zh")
+    )
+
+
 def _replace_term_form(text: str, old_form: str, new_form: str) -> str:
     old_form = str(old_form or "").strip()
     if not old_form:
@@ -5393,6 +5448,7 @@ def apply_proofread_safety_constraints(
     regression_only: bool = False,
     safety_mode: Optional[bool] = None,
     safety_events: Optional[list[str]] = None,
+    semantic_anchor_enabled: bool = True,
 ) -> tuple[str, str, dict]:
     """Apply edits while blocking deterministic semantic and terminology regressions."""
     safety_events = safety_events if safety_events is not None else []
@@ -5418,6 +5474,7 @@ def apply_proofread_safety_constraints(
         source_edit_supported = evidence_supports_source
     source_has_regression = bool(
         safety_mode_enabled
+        and semantic_anchor_enabled
         and new_source != original_source
         and semantic_anchor_regressions(original_source, original_source, new_source)
     )
@@ -5428,7 +5485,7 @@ def apply_proofread_safety_constraints(
         if safety_mode_enabled
         else edit_supports_change(normalized_edit, "target", strict_preservation)
     )
-    if safety_mode_enabled and new_target != original_target:
+    if safety_mode_enabled and semantic_anchor_enabled and new_target != original_target:
         target_anchor_regressions = semantic_anchor_regressions(
             original_source, original_target, new_target
         )
@@ -5924,6 +5981,25 @@ def proofread_split_events(
             fallback_pairs,
             ctx,
         )
+        # A proofread tool call may have added evidence for this very batch.
+        # Promote only validated mappings before evaluating the candidate, so
+        # the initial proposal and any later retry share the same constraints.
+        if search_runtime is not None:
+            evidence_sidecar = enrich_candidate_asr_term_evidence(
+                transcript,
+                search_runtime.sidecar,
+                [
+                    (event.en, (parsed[0] or event.en).strip())
+                    for event, parsed in zip(batch_events, parsed_results)
+                ],
+            )
+            search_runtime.sidecar = evidence_sidecar
+            if evidence_sidecar.has_evidence():
+                write_web_evidence_sidecar(ctx, evidence_sidecar)
+            batch_term_context = [
+                relevant_term_evidence(event.en, evidence_sidecar)
+                for event in batch_events
+            ]
         batch_changed = False
         for index, (event, (en, zh, review, edit)) in enumerate(zip(batch_events, parsed_results)):
             candidate_en = en.strip() or event.en
@@ -5949,6 +6025,7 @@ def proofread_split_events(
                 batch_term_context[index][1],
                 safety_mode=safety_mode_enabled,
                 safety_events=safety_events,
+                semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
             )
             if breaks_cross_event_sentence_boundary(
                 new_en,
@@ -5978,6 +6055,7 @@ def proofread_split_events(
                     batch_term_context[index][1],
                     safety_mode=safety_mode_enabled,
                     safety_events=safety_events,
+                    semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
                 )
             if search_runtime is not None:
                 unresolved_reasons = search_runtime.unresolved_reasons(item_offset + index + 1)
