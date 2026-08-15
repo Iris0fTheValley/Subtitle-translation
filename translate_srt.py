@@ -12,6 +12,7 @@ sentences back onto the timeline.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -507,6 +508,11 @@ def translate_llm_from_env(env: dict[str, str], batch_size: int) -> LLMConfig:
         model=env.get("TRANSLATE_MODEL", "").strip(),
         batch_size=batch_size,
     )
+
+
+def translate_concurrency_from_env(env: dict[str, str]) -> int:
+    """Keep first-pass request parallelism independent from proofreading."""
+    return max(1, env_int(env.get("TRANSLATE_CONCURRENCY", ""), 1))
 
 
 def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_size: int) -> LLMConfig:
@@ -3935,6 +3941,7 @@ def make_source_item(
     ctx: TranscriptContext,
     source_text: str,
     retrieved_context: Optional[list[dict]] = None,
+    sentence_context: Optional[dict] = None,
 ) -> LLMBatchItem:
     return make_language_item(
         item_id,
@@ -3942,6 +3949,7 @@ def make_source_item(
         source=source_text,
         extra={
             "retrieved_context": retrieved_context or [],
+            "sentence_context": sentence_context or {},
         },
     )
 
@@ -4535,6 +4543,7 @@ def translate_segments(
     system_prompt: str,
     quiet: bool,
     retriever: ContextRetriever | None = None,
+    concurrency: int = 1,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -4546,8 +4555,8 @@ def translate_segments(
         print(f"Translator: {llm.provider} / {llm.model_name()}", file=sys.stderr)
         print(f"Total segments: {len(pending)}", file=sys.stderr)
 
-    session = ChatSession(
-        llm,
+    worker_count = max(1, int(concurrency or 1))
+    translate_system_prompt = (
         system_prompt
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
         + "\n\n"
@@ -4555,14 +4564,37 @@ def translate_segments(
         + "\n\n"
         + _JSON_BATCH_FORMAT
         + "\n\n"
-        + render_prompt_template(_TRANSLATE_FORMAT, ctx),
-        temperature=0.3,
+        + render_prompt_template(_TRANSLATE_FORMAT, ctx)
     )
+    # A context snapshot is derived from the complete, stable transcript—not
+    # from a request batch—so batch edges and recursive size recovery retain
+    # the same neighboring subtitles.  It intentionally uses sentence_context
+    # rather than reviving split-specific context_before/context_after fields.
+    ordered_segments = list(transcript.segments)
+    translation_contexts = {
+        segment.index: {
+            "previous": (
+                LanguageFields.from_ctx(ctx).build(
+                    source=ordered_segments[position - 1].en_text()
+                ) | {"id": ordered_segments[position - 1].index}
+            ) if position else {},
+            "next": (
+                LanguageFields.from_ctx(ctx).build(
+                    source=ordered_segments[position + 1].en_text()
+                ) | {"id": ordered_segments[position + 1].index}
+            ) if position + 1 < len(ordered_segments) else {},
+            "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
+        }
+        for position, segment in enumerate(ordered_segments)
+    }
+    shared_session = ChatSession(llm, translate_system_prompt, temperature=0.3) if worker_count == 1 else None
     changed = False
 
     def apply_translation_batch(
         batch: list[TranscriptSegment],
-        contexts: list[list[dict]],
+        retrieved_contexts: list[list[dict]],
+        adjacent_contexts: list[dict],
+        session: ChatSession,
     ) -> bool:
         request = LLMBatchRequest(
             [
@@ -4570,7 +4602,8 @@ def translate_segments(
                     segment.index,
                     ctx,
                     segment.en_text(),
-                    retrieved_context=contexts[index],
+                    retrieved_context=retrieved_contexts[index],
+                    sentence_context=adjacent_contexts[index],
                 )
                 for index, segment in enumerate(batch)
             ]
@@ -4596,16 +4629,22 @@ def translate_segments(
                         f"  Translate batch {reason}; splitting ids {batch[0].index}-{batch[-1].index}",
                         file=sys.stderr,
                     )
-                left_changed = apply_translation_batch(batch[:middle], contexts[:middle])
-                right_changed = apply_translation_batch(batch[middle:], contexts[middle:])
+                left_changed = apply_translation_batch(
+                    batch[:middle], retrieved_contexts[:middle], adjacent_contexts[:middle], session
+                )
+                right_changed = apply_translation_batch(
+                    batch[middle:], retrieved_contexts[middle:], adjacent_contexts[middle:], session
+                )
                 return left_changed or right_changed
-            if is_context_length_error(error) and any(contexts):
+            if is_context_length_error(error) and any(retrieved_contexts):
                 if not quiet:
                     print(
                         f"  Translate id {batch[0].index} too large with retrieved context; retrying without it",
                         file=sys.stderr,
                     )
-                return apply_translation_batch(batch, [[] for _ in batch])
+                return apply_translation_batch(
+                    batch, [[] for _ in batch], adjacent_contexts, session
+                )
             print(f"Warning: translation batch failed: {error}", file=sys.stderr)
             return False
 
@@ -4621,16 +4660,17 @@ def translate_segments(
                 print(f"Warning: translation missing for segment id {segment.index}", file=sys.stderr)
                 continue
             translated = apply_glossary_ui_translation(
-                segment.en_text(), translated, contexts[index], ctx
+                segment.en_text(), translated, retrieved_contexts[index], ctx
             )
             segment.translation = translated
             segment.review = merge_retrieval_review_evidence(
-                segment.en_text(), parsed.review, contexts[index]
+                segment.en_text(), parsed.review, retrieved_contexts[index]
             )
             segment.split_events = []
             batch_changed = True
         return batch_changed
 
+    work_units: list[tuple[int, list[TranscriptSegment], list[list[dict]], list[dict]]] = []
     for start in range(0, len(pending), llm.batch_size):
         batch = pending[start : start + llm.batch_size]
         if not quiet:
@@ -4639,8 +4679,24 @@ def translate_segments(
                 f"translating {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever is not None else [[] for _ in batch]
-        changed = apply_translation_batch(batch, contexts) or changed
+        retrieved_contexts = (
+            retriever.retrieve_texts([seg.en_text() for seg in batch])
+            if retriever is not None else [[] for _ in batch]
+        )
+        work_units.append((start, batch, retrieved_contexts, [translation_contexts[seg.index] for seg in batch]))
+
+    def run_work_unit(work_unit: tuple[int, list[TranscriptSegment], list[list[dict]], list[dict]]) -> bool:
+        _start, batch, retrieved_contexts, adjacent_contexts = work_unit
+        # Concurrent work units must not use a shared chat history for context.
+        session = shared_session or ChatSession(llm, translate_system_prompt, temperature=0.3)
+        return apply_translation_batch(batch, retrieved_contexts, adjacent_contexts, session)
+
+    if worker_count == 1:
+        for work_unit in work_units:
+            changed = run_work_unit(work_unit) or changed
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            changed = any(executor.map(run_work_unit, work_units))
     return changed
 
 
@@ -5675,6 +5731,7 @@ def main() -> None:
         system_prompt,
         args.quiet,
         retriever,
+        concurrency=translate_concurrency_from_env(env),
     )
     changed = split_segments(
         transcript,

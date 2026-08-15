@@ -1597,6 +1597,60 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "translation memory"}])
         self.assertEqual(retriever.texts, ["source text"])
 
+    def test_translate_sentence_context_is_stable_across_batch_boundaries_and_concurrency(self):
+        requests = []
+
+        def fake_batch(request, session, quiet, **_kwargs):
+            item = request.to_json_value()["items"][0]
+            requests.append((item, id(session)))
+            return [{"id": item["id"], "zh": f"译文{item['id']}"}]
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First unfinished"),
+                t.TranscriptSegment(2, 1.0, 2.0, "continues here"),
+                t.TranscriptSegment(3, 2.0, 3.0, "Final sentence."),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            t.translate_segments(
+                transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                concurrency=2,
+            )
+
+        by_id = {item["id"]: item for item, _session_id in requests}
+        self.assertEqual(by_id[1]["sentence_context"]["next"]["id"], 2)
+        self.assertNotIn("previous", by_id[1]["sentence_context"])
+        self.assertEqual(by_id[2]["sentence_context"]["previous"]["id"], 1)
+        self.assertEqual(by_id[2]["sentence_context"]["next"]["id"], 3)
+        self.assertEqual(by_id[3]["sentence_context"]["previous"]["id"], 2)
+        self.assertNotIn("next", by_id[3]["sentence_context"])
+        self.assertEqual(len({session_id for _item, session_id in requests}), 3)
+
+    def test_translate_sentence_context_survives_recursive_batch_recovery(self):
+        requests = []
+
+        def fake_batch(request, session, quiet, **_kwargs):
+            items = request.to_json_value()["items"]
+            requests.append(items)
+            if len(items) > 1:
+                raise RuntimeError("response validation failed")
+            return [{"id": items[0]["id"], "zh": "译文"}]
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First"),
+                t.TranscriptSegment(2, 1.0, 2.0, "Middle"),
+                t.TranscriptSegment(3, 2.0, 3.0, "Last"),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            self.assertTrue(t.translate_segments(transcript, self.ctx, FakeBatchLLM(3), "system", quiet=True))
+
+        recovered_middle = next(items[0] for items in requests if len(items) == 1 and items[0]["id"] == 2)
+        self.assertEqual(recovered_middle["sentence_context"]["previous"]["id"], 1)
+        self.assertEqual(recovered_middle["sentence_context"]["next"]["id"], 3)
+
     def test_proofread_split_events_adds_retrieved_context(self):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
