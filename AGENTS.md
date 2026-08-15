@@ -225,7 +225,7 @@ proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PR
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`web_evidence:*` Tavily 网页证据 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`web_evidence:*` 由 `<base>.web_evidence.json` 中的规范化 Tavily 结果构建，保留 query、域名、标题、URL 和证据摘要；`transcript:*` 使用干净字幕文本建向量，retrieved context 返回带时间码的字幕行，并按字符数、时间跨度、segment 数量切块，按末尾时间窗口自动 overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
+`glossary.md` 是完整常驻的全局硬规则；retrieved_context 只能补充，不能截断或替代它。`<base>.web_evidence.json` 的 `confirmed_terms` 是经网页正文映射、来源质量和冲突规则验证后的持久化 source→target 映射：glossary 的全局规则优先，命中的 confirmed term 是可追溯局部约束，retrieved_context 优先级最低；任何冲突都必须 human review，不能静默漂移或改写 glossary。`confirmed_terms` 随 sidecar 跨重跑保存，并在 proofread 的初次候选和 safety retry 前从最新 sidecar enrich。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`web_evidence:*` 网页证据 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；这些按当前字幕逐条召回为 `retrieved_context`。proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
