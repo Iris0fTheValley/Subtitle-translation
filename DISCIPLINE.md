@@ -7,7 +7,7 @@
 
 ## 0. 与当前 GitHub Branch Ruleset 对齐
 
-当前 `main` 已启用 ruleset：**`main branch lock`**（active，仅作用于 `refs/heads/main`）。本文的所有要求不得弱化该 ruleset，ruleset 未覆盖的部分由本文件补强。
+当前 `main` 已启用 ruleset：**`main branch lock`**（[规则链接](https://github.com/The-Bazzar/Subtitle-translation/rules/20808481)，active，仅作用于 `refs/heads/main`）。本文的所有要求不得弱化该 ruleset，ruleset 未覆盖的部分由本文件补强。
 
 | Ruleset 项 | 当前配置 | 协作要求 |
 |---|---|---|
@@ -17,20 +17,26 @@
 | pull_request | `required_review_thread_resolution=true` | 所有评审 thread 必须逐条 resolve，不得强行合并 |
 | pull_request | `allowed_merge_methods=["merge"]` | 只允许 **merge commit** 进入 `main`，不得 squash/rebase 合并 |
 | code_quality | `severity=warnings` | PR 不得引入 code quality warnings |
-| code_scanning | CodeQL，security alerts ≥ high，errors 阻断 | 不得引入高危告警或 error 级 CodeQL 结果 |
+| code_scanning | CodeQL，security alerts ≥ high，errors 阻断 | 已配置 `.github/workflows/codeql.yml`（Python，`security-and-quality`）；不得引入高危告警或 error 级 CodeQL 结果 |
 | copilot_code_review | `review_on_push=true`，draft PR 不审 | 推送后保留 Copilot 意见，由人类逐条确认或说明不采纳原因 |
 | merge_queue | `ALLGREEN`，5/1/5，min wait 5min | 普通合并必须通过 merge queue，不得绕过 |
 
+**当前已落地的自动化：**
+- 全量 unittest：`main` 基线必须 `Ran 124 tests / OK`。
+- CodeQL：`.github/workflows/codeql.yml` 已启用。
+- Copilot code review：每次 push 自动触发。
+- merge queue：`ALLGREEN` 通过后才允许合并。
+
 **ruleset 的缺口需要人工纪律补上：**
 - 当前 `required_approving_review_count=0`。本规范强制要求：**至少 1 名 maintainer 明确 approve**，且所有自动化检查通过后，才允许进入 merge queue。
-- 仅仓库 owner 配置有 ruleset bypass。bypass 只用于紧急修复，使用后必须在 24 小时内补 PR/Issue 复盘（见 6.7）。
+- 仅仓库 owner 配置有 ruleset bypass。bypass 只允许按 6.7 节使用，不得扩大到普通代码变更。
 
 ---
 
 ## 1. 协作总则
 
 1. `main` 永远可发布。它只接受经过完整评审、测试和 merge queue 的合并提交。
-2. 所有代码、配置、文档、脚本行为变更一律通过 PR；不得直接向 `main` push。
+2. 所有代码、配置、文档、脚本行为变更一律通过 PR；除 6.7 节 maintainer bypass 明确允许的治理/紧急场景外，不得直接向 `main` push。
 3. 一个 PR 只解决一个问题；禁止把“顺手重构”“顺手修 typo”“顺手改 prompt”混入同一 PR。
 4. 每位贡献者在 push 前必须本地完成：格式化检查、测试、自审 diff。
 5. 维护者有权对不符合本规范的 PR 直接 `CHANGES_REQUESTED` 或关闭，并在评论中引用本文件具体条目。
@@ -52,6 +58,7 @@
 | `chore/` | 构建、依赖、琐碎维护 | `chore/exa-py-floor` |
 | `release/` | 发布准备 | `release/v1.7.10` |
 | `agent/` | 自动化代理产出的实验分支 | `agent/proofread-concurrency-transactional` |
+| `ci/` | CI、CodeQL、Actions 等自动化配置 | `ci/codeql-security-and-quality` |
 
 ### 2.2 命名规则
 
@@ -109,7 +116,7 @@ uv run python -m unittest discover -s tests
 ```
 
 **测试基线：**
-历史 `v1.7.9` 基线存在 3 个测试问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误），已由 `test/align-baseline-tests`（PR #8）修复。该 PR 合入后，`main` 全量测试必须为 `OK`，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
+`main` 当前基线为 `Ran 124 tests` 且必须 `OK`。历史 `v1.7.9` 的 3 个基线问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误）已由 PR #8 修复，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
 
 **其他强制要求：**
 - 修改 `translate_srt.py`：必须跑全量 unittest，且至少有一个新增/调整的测试直接覆盖改动行为。
@@ -143,7 +150,7 @@ uv run python -m unittest discover -s tests
 
 ## Validation
 - 命令：`.venv/bin/python -m unittest discover -s tests`
-- 结果：Ran N tests；新增失败/错误 0
+- 结果：Ran N tests；新增失败/错误 0；`main` 基线当前为 `Ran 124 tests / OK`
 - 新增测试名称及覆盖点
 - 人工验证步骤（涉及脚本/CLI 时）
 
@@ -288,7 +295,7 @@ uv run python -m unittest discover -s tests
 <type>(<scope>): <subject>
 ```
 
-- `type`: `feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `build`
+- `type`: `feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `ci` / `build`
 - `subject` ≤ 72 字符，小写开头，不以句号结尾
 - 需要解释“为什么”时补 body；破坏性变更补 `BREAKING CHANGE:` 并同步 `MIGRATION.md`
 - 示例：`fix(proofread): honor zero web search budgets`
@@ -298,7 +305,7 @@ uv run python -m unittest discover -s tests
 - 行为或配置变更必须同步 `AGENTS.md`、`README.md`、`.env.example` 和两个 setup 升级流程。
 - 用户可见破坏性变更必须新增/更新 `MIGRATION.md`。
 - `AGENTS.md` 是技术权威文档；PR 不得只改代码不更新文档。
-- 本 `DISCIPLINE.md` 修改也必须走 PR，且不得弱化任何既有规则。
+- 本 `DISCIPLINE.md` 修改原则上走 PR；只有 maintainer 明确发起的仓库治理/CI 配置调整可按 6.7 节 bypass，但必须在 commit message 中注明原因，且不得弱化任何既有规则。
 
 ### 6.3 密钥、配置与产物
 
@@ -332,18 +339,26 @@ git diff --cached --name-only | grep -E '(\.env$|providers\.json$|cookies\.txt$|
 ### 6.6 Merge Queue 操作
 
 - 仅 `main` 受 merge queue 保护。
-- PR 必须先通过全部 checks，再进入 merge queue；队列按 `ALLGREEN` 分组，最少等待 5 分钟。
+- PR 必须先通过全部 checks（unittest、CodeQL、code quality、Copilot review 等），再进入 merge queue；队列按 `ALLGREEN` 分组，最少等待 5 分钟。
 - 队列中的 PR 不得再 force-push；如需更新，退出队列，修正后重新入队。
 - 合并方式只允许 merge commit；不得在本地 rebase `main` 后强推。
 
-### 6.7 紧急 bypass 规则
+### 6.7 Maintainer bypass 规则
 
-- 只有 maintainer 在真实线上故障（pipeline 完全不可用、密钥泄漏、阻断性错误）时，才允许使用 ruleset bypass 直接修复 `main`。
+ruleset 仅允许仓库 owner/maintainer 在极窄范围内 bypass。允许场景只有两类：
+
+1. **紧急修复**：真实线上故障，例如 pipeline 完全不可用、密钥泄漏、阻断性错误。
+2. **仓库治理/CI 配置**：maintainer 明确发起的治理文件或 CI 配置更新（如 `DISCIPLINE.md`、`CODEOWNERS`、`.github/workflows/*`），且该更新无法或不宜等待 PR 流程时。
+
+执行要求：
+
+- commit message 必须写明 `bypass:` 原因，例如 `docs: tidy DISCIPLINE.md (bypass: maintainer governance)`。
 - 紧急修复后 24 小时内必须：
   1. 补一个 `fix/` PR 记录实际 diff；
   2. 在 PR 描述中写明 bypass 原因、时间、影响面；
   3. 补全测试与文档。
-- 非紧急情况使用 bypass 视为违规。
+- 治理/CI 类 bypass 必须在随后 PR 或 commit history 中可追溯，不得夹带业务代码。
+- 除上述两类外，任何绕过 PR 直接修改 `main` 均视为违规。
 
 ### 6.8 违规处理
 
