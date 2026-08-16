@@ -2794,7 +2794,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
-        template = os.path.abspath("template.ass")
+        template = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "template.ass.example"))
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 
         with tempfile.TemporaryDirectory() as tmp:
