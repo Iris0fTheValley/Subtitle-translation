@@ -12,6 +12,7 @@ sentences back onto the timeline.
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import hashlib
 import json
@@ -646,6 +647,7 @@ class LLMConfig:
     model: str = ""
     api_key: Optional[str] = None
     batch_size: int = 50
+    request_overrides: dict = field(default_factory=dict)
 
     def resolve_key(self) -> str:
         if self.api_key is None:
@@ -5171,13 +5173,67 @@ class CompletionRetryTemplate:
         return max(0.0, float(self.base_delay or 0.0) * float(attempt_index + 1))
 
 
+class LLMOutputLengthError(RuntimeError):
+    """The provider stopped before returning a complete response."""
+
+
+_REMOVED_PROVIDER_SEARCH = object()
+
+
+def deep_merge_dicts(base: dict, override: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def strip_provider_search_options(value, *, _root: bool = True):
+    """Copy request options while removing provider-native web-search tools."""
+    if isinstance(value, dict):
+        normalized_keys = {str(key).strip().lower() for key in value}
+        tool_type = str(value.get("type", "")).strip().lower()
+        if normalized_keys & {"google_search", "google_search_retrieval"}:
+            return {} if _root else _REMOVED_PROVIDER_SEARCH
+        if tool_type in {"web_search", "web_search_preview"}:
+            return {} if _root else _REMOVED_PROVIDER_SEARCH
+        cleaned = {}
+        removed_child = False
+        for key, child in value.items():
+            scrubbed = strip_provider_search_options(child, _root=False)
+            if scrubbed is _REMOVED_PROVIDER_SEARCH:
+                removed_child = True
+                continue
+            cleaned[key] = scrubbed
+        if not cleaned and removed_child and not _root:
+            return _REMOVED_PROVIDER_SEARCH
+        return cleaned
+    if isinstance(value, list):
+        cleaned = []
+        removed_child = False
+        for child in value:
+            scrubbed = strip_provider_search_options(child, _root=False)
+            if scrubbed is _REMOVED_PROVIDER_SEARCH:
+                removed_child = True
+                continue
+            cleaned.append(scrubbed)
+        if not cleaned and removed_child and not _root:
+            return _REMOVED_PROVIDER_SEARCH
+        return cleaned
+    return value
+
+
 @dataclass
 class ChatSession:
     llm: LLMConfig
     system_prompt: str
     temperature: float = 0.3
     disable_response_format: bool = False
+    disable_provider_search: bool = False
     messages: list[dict] = field(default_factory=list)
+    provider_retry_count: int = 0
 
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
@@ -5190,8 +5246,13 @@ class ChatSession:
                 return self._create_once(extra_kwargs)
             except Exception as e:
                 last_error = e
-                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                if (
+                    attempt >= template.normalized_attempts() - 1
+                    or is_context_length_error(e)
+                    or is_output_length_error(e)
+                ):
                     raise
+                self.provider_retry_count += 1
                 self._wait_before_retry(template, attempt, e)
         raise RuntimeError(f"LLM completion failed: {last_error}")
 
@@ -5206,11 +5267,15 @@ class ChatSession:
         if request_kwargs is not None:
             if not isinstance(request_kwargs, dict):
                 raise ValueError("provider request_kwargs must be a JSON object")
-            kwargs.update(request_kwargs)
+            kwargs = deep_merge_dicts(kwargs, request_kwargs)
+        if self.llm.request_overrides:
+            kwargs = deep_merge_dicts(kwargs, self.llm.request_overrides)
         response_format = provider_cfg.get("response_format")
         if response_format and "response_format" not in kwargs:
             kwargs["response_format"] = response_format
         kwargs.update(extra_kwargs)
+        if self.disable_provider_search:
+            kwargs = strip_provider_search_options(kwargs)
         if self.disable_response_format:
             kwargs.pop("response_format", None)
         return self.llm._client().chat.completions.create(**kwargs)
@@ -5227,35 +5292,54 @@ class ChatSession:
         retry_feedback=None,
     ):
         template = retry_template or CompletionRetryTemplate(attempts=1)
+        request_history_start = len(self.messages)
         self.messages.append({"role": "user", "content": content})
         last_error: Exception | None = None
-        for attempt in range(template.normalized_attempts()):
-            answer: str | None = None
-            try:
-                resp = self._create_once({})
-                answer = self._answer_from_response(resp)
-                parsed = validator(answer) if validator is not None else answer
-                self.messages.append({"role": "assistant", "content": answer})
-                return answer, parsed
-            except Exception as e:
-                last_error = e
-                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
-                    raise
-                if retry_feedback is not None and answer is not None:
+        try:
+            for attempt in range(template.normalized_attempts()):
+                answer: str | None = None
+                try:
+                    resp = self._create_once({})
+                    answer = self._answer_from_response(resp)
+                    parsed = validator(answer) if validator is not None else answer
                     self.messages.append({"role": "assistant", "content": answer})
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": str(retry_feedback(answer, e, attempt)),
-                        }
-                    )
-                self._wait_before_retry(template, attempt, e)
-        raise RuntimeError(f"LLM completion failed: {last_error}")
+                    return answer, parsed
+                except Exception as e:
+                    last_error = e
+                    if (
+                        attempt >= template.normalized_attempts() - 1
+                        or is_context_length_error(e)
+                        or is_output_length_error(e)
+                    ):
+                        raise
+                    self.provider_retry_count += 1
+                    if retry_feedback is not None and answer is not None:
+                        self.messages.append({"role": "assistant", "content": answer})
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": str(retry_feedback(answer, e, attempt)),
+                            }
+                        )
+                    self._wait_before_retry(template, attempt, e)
+            raise RuntimeError(f"LLM completion failed: {last_error}")
+        except BaseException:
+            # Recursive recovery must start from the last successful turn.
+            del self.messages[request_history_start:]
+            raise
 
     def _answer_from_response(self, resp) -> str:
         choice = resp.choices[0]
         message = choice.message
         answer = message.content or ""
+        finish_reason = str(getattr(choice, "finish_reason", "") or "").casefold()
+        if finish_reason in {"length", "max_tokens"}:
+            raise LLMOutputLengthError(
+                "LLM output was truncated "
+                f"(provider={getattr(self.llm, 'provider', 'unknown')}, "
+                f"model={self.llm.model_name()}, finish_reason={finish_reason}, "
+                f"content_chars={len(answer)})"
+            )
         if not answer.strip():
             reasoning = getattr(message, "reasoning_content", None)
             refusal = getattr(message, "refusal", None)
@@ -5928,6 +6012,13 @@ def is_context_length_error(error: Exception | str) -> bool:
             "too many tokens",
             "reduce the length",
         )
+    )
+
+
+def is_output_length_error(error: Exception | str) -> bool:
+    text = str(error or "").casefold()
+    return isinstance(error, LLMOutputLengthError) or (
+        "finish_reason=length" in text or "finish_reason=max_tokens" in text
     )
 
 
