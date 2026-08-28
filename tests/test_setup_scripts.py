@@ -11,14 +11,15 @@ def read_script(name: str) -> str:
 
 
 class SetupScriptTests(unittest.TestCase):
-    def test_glossary_budget_upgrade_preserves_legacy_tavily_value(self):
+    def test_setup_scripts_initialize_shared_web_search_config(self):
         env_example = read_script(".env.example")
-        self.assertRegex(env_example, r"(?m)^GLOSSARY_SEARCH_MAX_QUERIES=$")
-        self.assertRegex(env_example, r"(?m)^TAVILY_MAX_QUERIES=15$")
+        self.assertNotRegex(env_example, r"(?m)^(?:TAVILY|EXA)_MAX_RESULTS=")
+        self.assertNotRegex(env_example, r"(?m)^(?:GLOSSARY_SEARCH|TAVILY_MAX_QUERIES|WEB_SEARCH_PROVIDER)=")
         for script in ("setup.ps1", "setup.sh"):
             with self.subTest(script=script):
                 body = read_script(script)
                 self.assertIn(".env.example", body)
+                self.assertIn("web_search.example.json", body)
                 self.assertRegex(body, r"(?i)missing")
 
     def test_setup_scripts_clear_project_venv_before_recreating(self):

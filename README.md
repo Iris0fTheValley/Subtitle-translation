@@ -30,6 +30,7 @@
 ├── template.ass.example
 ├── .env.example
 ├── providers.example.json
+├── web_search.example.json
 ├── tavily_domains.example.json
 ├── glossary_prompt.example.md
 ├── translate_prompt.example.md
@@ -37,7 +38,7 @@
 └── split_prompt.example.md
 ```
 
-时间轴美化和 glossary 生成已集中到 `translate_srt.py`。主链路不再使用 SRT，WhisperX `.json` 是唯一字幕输入。`glossary_prompt.md` / `split_prompt.md` 可作为本地风格微调文件使用，`tavily_domains.json` 可维护题材相关站点；这些本地文件不提交，仓库只提交对应 example。
+时间轴美化和 glossary 生成已集中到 `translate_srt.py`。主链路不再使用 SRT，WhisperX `.json` 是唯一字幕输入。`glossary_prompt.md` / `split_prompt.md` 可作为本地风格微调文件使用，`tavily_domains.json` 可维护题材相关站点，`web_search.json` 可维护联网 provider、统一结果数和阶段预算；这些本地文件不提交，仓库只提交对应 example。
 
 ## 快速使用
 
@@ -130,7 +131,7 @@ bash "<repo>/merge_ass.sh" "video.zh.ass" "video.en.ass"
 
 ## 配置
 
-运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和 `template.ass`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。
+运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`web_search.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和 `template.ass`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。
 
 setup 后至少配置：
 
@@ -163,25 +164,21 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
 | `PROOFREAD_ENHANCED` | `1/0` 显式启用证据增强校对和按需联网搜索，默认 `0`；仅设置 provider/model 不会开启联网 |
-| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；`0` 禁止新的网络请求，但仍允许读取和复用持久化 exact evidence/cache |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
-| `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
-| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa，当前 `contents` 搜索调用要求 `exa-py>=2.0.0` |
-| `TAVILY_API_KEY` | glossary 联网搜索 |
-| `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
-| `GLOSSARY_SEARCH_MAX_QUERIES` | glossary 新网络查询预算，默认 `15`，优先于兼容变量 `TAVILY_MAX_QUERIES`；`0` 禁止新的网络请求，已有 sidecar evidence 仍可读取 |
-| `TAVILY_MAX_QUERIES` | 兼容旧配置；仅当 `GLOSSARY_SEARCH_MAX_QUERIES` 为空时作为 glossary 查询预算，`0` 同样禁止新请求 |
+| `TAVILY_API_KEY` / `EXA_API_KEY` | Tavily/Exa 搜索 API keys；key 为空时对应 provider 禁用 |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
 `BURN_OVCOPTS=source-bitrate` 会用 `ffprobe` 读取源视频码率，并用 VBR 的 `b/maxrate/bufsize` 让硬字幕输出尽量接近源码率；显式设置 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`GLOSSARY_SEARCH_MAX_QUERIES` 控制新网络查询预算，并优先于兼容变量 `TAVILY_MAX_QUERIES`；设为 `0` 时不发起新请求，但已有 sidecar evidence 仍可供 glossary 和后续阶段读取。
+非敏感联网搜索配置位于本地 gitignored `web_search.json`（由 `web_search.example.json` 初始化），字段为 `provider`、统一 `max_results`、`glossary_max_queries` 和 `proofread_max_queries`。环境变量只保存 `TAVILY_API_KEY` / `EXA_API_KEY`。
+
+配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`web_search.json` 的 `glossary_max_queries` 控制新网络查询预算；设为 `0` 时不发起新请求，但已有 sidecar evidence 仍可供 glossary 和后续阶段读取。
 
 如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且已配置 Tavily 或 Exa，脚本会补建 sidecar 而不重写 glossary。
 
-证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。
+证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`web_search.json` 的 `proofread_max_queries` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
@@ -212,7 +209,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 
 ## 注意事项
 
-- `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
+- `.env`、`providers.json`、`web_search.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
 - 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；pipeline 和 `translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 统一使用项目 `.venv`，不调用全局 `python` / `python3`，也不要求用户设置 PATH。独立脚本可从任意工作目录通过包装器路径调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`

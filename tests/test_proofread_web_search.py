@@ -82,18 +82,21 @@ class ProofreadWebSearchTests(unittest.TestCase):
         setup_ps1 = (root / "setup.ps1").read_text(encoding="utf-8")
         setup_sh = (root / "setup.sh").read_text(encoding="utf-8")
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        web_search_example = (root / "web_search.example.json").read_text(encoding="utf-8")
 
         for key in (
             "PROOFREAD_ENHANCED",
-            "PROOFREAD_SEARCH_MAX_QUERIES",
-            "GLOSSARY_SEARCH_MAX_QUERIES",
-            "WEB_SEARCH_PROVIDER",
             "EXA_API_KEY",
-            "EXA_MAX_RESULTS",
         ):
             self.assertIn(f"{key}=", env_example)
             self.assertIn(f"`{key}`", readme)
             self.assertIn(f"`{key}`", agents)
+        for key in ("provider", "max_results", "glossary_max_queries", "proofread_max_queries"):
+            self.assertIn(f'"{key}"', web_search_example)
+            self.assertIn(f"`{key}`", readme)
+            self.assertIn(f"`{key}`", agents)
+        for key in ("TAVILY_MAX_RESULTS", "EXA_MAX_RESULTS", "GLOSSARY_SEARCH_MAX_QUERIES", "TAVILY_MAX_QUERIES", "WEB_SEARCH_PROVIDER"):
+            self.assertNotIn(f"{key}=", env_example)
         self.assertIn("Update-EnvFromExample", setup_ps1)
         self.assertIn("update_env_from_example", setup_sh)
         self.assertIn('"exa-py>=2.0.0"', pyproject)
@@ -114,12 +117,14 @@ class ProofreadWebSearchTests(unittest.TestCase):
             ).configured_providers(),
             ["tavily", "exa"],
         )
-        self.assertEqual(
-            t.WebSearchSettings.from_env(
-                {"TAVILY_API_KEY": "t", "WEB_SEARCH_PROVIDER": "exa"}
-            ).configured_providers(),
-            [],
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"provider": "exa"}, f)
+            self.assertEqual(
+                t.WebSearchSettings.from_env({"TAVILY_API_KEY": "t"}, config_path).configured_providers(),
+                [],
+            )
 
     def test_web_search_settings_do_not_expose_an_unenforced_timeout(self):
         settings = t.WebSearchSettings.from_env({})
@@ -283,10 +288,14 @@ class ProofreadWebSearchTests(unittest.TestCase):
                     )],
                 )]),
             )
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"proofread_max_queries": 0}, f)
             runtime = t.proofread_search_runtime_from_env(
-                {"PROOFREAD_ENHANCED": "1", "PROOFREAD_SEARCH_MAX_QUERIES": "0"},
+                {"PROOFREAD_ENHANCED": "1"},
                 ctx,
                 quiet=True,
+                config_path=config_path,
             )
             self.assertIsNotNone(runtime)
             with patch.object(t, "tavily_search") as online:
@@ -300,14 +309,17 @@ class ProofreadWebSearchTests(unittest.TestCase):
     def test_zero_budget_cache_miss_never_calls_configured_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"proofread_max_queries": 0}, f)
             runtime = t.proofread_search_runtime_from_env(
                 {
                     "PROOFREAD_ENHANCED": "1",
-                    "PROOFREAD_SEARCH_MAX_QUERIES": "0",
                     "TAVILY_API_KEY": "configured-key",
                 },
                 ctx,
                 quiet=True,
+                config_path=config_path,
             )
             self.assertIsNotNone(runtime)
             self.assertEqual(runtime.max_queries, 0)

@@ -136,7 +136,7 @@ winget install Microsoft.PowerShell
 - 本地脚本会把 YouTube 原视频元信息前置写入 `glossary.md`，包括标题、作者、上传时间、原简介和标签；这部分不交给远端 LLM 合成
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
 - 联网搜索结果是 glossary 的优先证据来源；远端 LLM 应用搜索结果校正 transcript 中可能的 ASR 人名、标题、引文和术语错误
-- 联网搜索默认由 glossary agent 在同一个 ChatSession 中通过搜索 tool calls 发起；运行时按 `WEB_SEARCH_PROVIDER` 路由 Tavily 或 Exa，并把结果回喂同一 session
+- 联网搜索默认由 glossary agent 在同一个 ChatSession 中通过搜索 tool calls 发起；运行时按 `web_search.json` 的 `provider` 路由 Tavily 或 Exa，并把结果回喂同一 session
 - 原始网页证据会规范化写入 `<base>.web_evidence.json` sidecar；它独立于 `glossary.md`，用于后续检索和复核
 - 第一轮 glossary user JSON 会包含 metadata、transcript/retrieved context 和合并后的 `tavily_domains.json` 域名偏好
 - Tavily tool 本地先按 `tavily_domains.json` 的全局百科域名和题材站点执行 `include_domains` 搜索；结果不足时再执行普通搜索；合并时优先百科/知识库域名
@@ -218,23 +218,20 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `PROOFREAD_ENHANCED` | `1` 显式启用证据增强校对和按需联网；默认 `0`，选择 provider/model 不会隐式开启 |
-| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；`0` 禁止新的网络请求，但仍允许读取和复用持久化 exact evidence/cache |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
-| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` | Tavily 搜索凭据和单次结果上限 |
-| `GLOSSARY_SEARCH_MAX_QUERIES` | glossary 新网络查询预算，默认 `15`，优先于兼容变量 `TAVILY_MAX_QUERIES`；`0` 禁止新请求，已有 sidecar evidence 仍可读取 |
-| `TAVILY_MAX_QUERIES` | 兼容旧配置；仅当 `GLOSSARY_SEARCH_MAX_QUERIES` 为空时生效，`0` 同样禁止新请求 |
-| `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
-| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa，当前 `contents` 搜索调用要求 `exa-py>=2.0.0` |
+| `TAVILY_API_KEY` / `EXA_API_KEY` | Tavily/Exa 搜索 API keys；key 为空时对应 provider 禁用 |
 
-proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `PROOFREAD_SEARCH_MAX_QUERIES` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
+非敏感联网搜索配置位于本地 gitignored `web_search.json`（由 `web_search.example.json` 初始化）：`provider`、统一 `max_results`、`glossary_max_queries` 和 `proofread_max_queries`。不要把这些配置放回 `.env`。
+
+proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `web_search.json` 的 `proofread_max_queries` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`GLOSSARY_SEARCH_MAX_QUERIES` 控制新网络请求，优先于兼容变量 `TAVILY_MAX_QUERIES`；`0` 禁止新请求但不删除或屏蔽已有 sidecar evidence。Tavily tool 会结合 metadata、模型给出的 `topic_hints` 和 `tavily_domains.json` 做域名优先搜索，并在最终合并时给百科/知识库域名加权。该阶段使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL`，不要为了省成本使用弱模型。
+配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`web_search.json` 的 `glossary_max_queries` 控制新网络请求，设为 `0` 时不发起新请求但不删除或屏蔽已有 sidecar evidence。Tavily tool 会结合 metadata、模型给出的 `topic_hints` 和 `tavily_domains.json` 做域名优先搜索，并在最终合并时给百科/知识库域名加权。该阶段使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL`，不要为了省成本使用弱模型。
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 

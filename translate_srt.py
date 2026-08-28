@@ -1140,6 +1140,14 @@ def env_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def nonnegative_int(value: str, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> bool:
     return not only_beautify
 
@@ -2764,21 +2772,45 @@ class WebSearchSettings:
     tavily_key: str = ""
     exa_key: str = ""
     provider: str = "auto"
-    tavily_max_results: int = 20
-    exa_max_results: int = 10
+    max_results: int = 10
+    glossary_max_queries: int = 15
+    proofread_max_queries: int = 5
 
     @staticmethod
-    def from_env(env: dict[str, str]) -> "WebSearchSettings":
-        provider = (env.get("WEB_SEARCH_PROVIDER", "auto") or "auto").strip().lower()
+    def _read_config(config_path: Optional[str]) -> dict:
+        path = config_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_search.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def from_env(env: dict[str, str], config_path: Optional[str] = None) -> "WebSearchSettings":
+        config = WebSearchSettings._read_config(config_path)
+        provider = str(config.get("provider", "auto") or "auto").strip().lower()
         if provider not in {"auto", "all", "tavily", "exa"}:
             provider = "auto"
+        max_results = max(1, min(env_int(str(config.get("max_results", 10)), 10), 100))
+        glossary_max_queries = nonnegative_int(str(config.get("glossary_max_queries", 15)), 15)
+        proofread_max_queries = nonnegative_int(str(config.get("proofread_max_queries", 5)), 5)
         return WebSearchSettings(
             tavily_key=env.get("TAVILY_API_KEY", "").strip(),
             exa_key=env.get("EXA_API_KEY", "").strip(),
             provider=provider,
-            tavily_max_results=env_int(env.get("TAVILY_MAX_RESULTS", ""), 20),
-            exa_max_results=env_int(env.get("EXA_MAX_RESULTS", ""), 10),
+            max_results=max_results,
+            glossary_max_queries=glossary_max_queries,
+            proofread_max_queries=proofread_max_queries,
         )
+
+    @property
+    def tavily_max_results(self) -> int:
+        return self.max_results
+
+    @property
+    def exa_max_results(self) -> int:
+        return self.max_results
 
     def configured_providers(self) -> list[str]:
         available = []
@@ -2952,7 +2984,10 @@ class WebSearchRuntime:
 
 
 def proofread_search_runtime_from_env(
-    env: dict[str, str], ctx: TranscriptContext, quiet: bool = False
+    env: dict[str, str],
+    ctx: TranscriptContext,
+    quiet: bool = False,
+    config_path: Optional[str] = None,
 ) -> WebSearchRuntime | None:
     """Build enhanced-proofread search from the user-facing configuration chain.
 
@@ -2961,11 +2996,12 @@ def proofread_search_runtime_from_env(
     """
     if not explicit_proofread_model_configured(env):
         return None
+    settings = WebSearchSettings.from_env(env, config_path)
     runtime = WebSearchRuntime(
-        settings=WebSearchSettings.from_env(env),
+        settings=settings,
         metadata_fields=read_video_metadata_fields(ctx),
         preferences=load_tavily_domain_preferences(),
-        max_queries=env_nonnegative_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5),
+        max_queries=settings.proofread_max_queries,
         sidecar=load_web_evidence_sidecar(ctx.web_evidence_json),
         quiet=quiet,
     )
@@ -3246,7 +3282,7 @@ def tavily_domain_preferences_to_json(preferences: TavilyDomainPreferences) -> d
 @dataclass(frozen=True)
 class GlossaryBuildOptions:
     tavily_key: str = ""
-    tavily_max_results: int = 20
+    tavily_max_results: int = 10
     tavily_max_queries: int = 15
     exa_key: str = ""
     exa_max_results: int = 10
@@ -3256,16 +3292,18 @@ class GlossaryBuildOptions:
     force: bool = False
 
     @staticmethod
-    def from_env(env: dict[str, str], quiet: bool = False, retriever=None, force: bool = False) -> "GlossaryBuildOptions":
-        settings = WebSearchSettings.from_env(env)
+    def from_env(
+        env: dict[str, str],
+        quiet: bool = False,
+        retriever=None,
+        force: bool = False,
+        config_path: Optional[str] = None,
+    ) -> "GlossaryBuildOptions":
+        settings = WebSearchSettings.from_env(env, config_path)
         return GlossaryBuildOptions(
             tavily_key=settings.tavily_key,
             tavily_max_results=settings.tavily_max_results,
-            tavily_max_queries=env_nonnegative_int(
-                env.get("GLOSSARY_SEARCH_MAX_QUERIES", "").strip()
-                or env.get("TAVILY_MAX_QUERIES", ""),
-                15,
-            ),
+            tavily_max_queries=settings.glossary_max_queries,
             exa_key=settings.exa_key,
             exa_max_results=settings.exa_max_results,
             search_provider=settings.provider,
@@ -3282,8 +3320,7 @@ class GlossaryBuildOptions:
             tavily_key=self.tavily_key,
             exa_key=self.exa_key,
             provider=self.search_provider,
-            tavily_max_results=self.tavily_max_results,
-            exa_max_results=self.exa_max_results,
+            max_results=max(1, int(self.tavily_max_results or self.exa_max_results or 1)),
         )
 
 
@@ -3313,8 +3350,7 @@ class GlossaryToolRuntime:
                 tavily_key=self.tavily_key,
                 exa_key=self.exa_key,
                 provider=self.search_provider,
-                tavily_max_results=self.max_results,
-                exa_max_results=self.exa_max_results,
+                max_results=self.max_results,
             ),
             metadata_fields=self.metadata_fields,
             preferences=self.preferences,
@@ -5489,6 +5525,7 @@ def infer_video_path(ctx: TranscriptContext) -> str:
 def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env = load_env(script_dir)
+    web_search_config_path = os.path.join(script_dir, "web_search.json")
 
     parser = argparse.ArgumentParser(
         description="Translate WhisperX JSON to proofread/target-language/bilingual ASS.",
@@ -5617,7 +5654,13 @@ def main() -> None:
             transcript,
             ctx,
             glossary_llm,
-            GlossaryBuildOptions.from_env(env, quiet=args.quiet, retriever=retriever, force=args.only_glossary),
+            GlossaryBuildOptions.from_env(
+                env,
+                quiet=args.quiet,
+                retriever=retriever,
+                force=args.only_glossary,
+                config_path=web_search_config_path,
+            ),
         )
         if embedding_active:
             updated_retriever = refresh_embedding_retriever(
@@ -5694,7 +5737,9 @@ def main() -> None:
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         enhanced_proofread = explicit_proofread_model_configured(env)
-        proofread_search_runtime = proofread_search_runtime_from_env(env, ctx, args.quiet)
+        proofread_search_runtime = proofread_search_runtime_from_env(
+            env, ctx, args.quiet, config_path=web_search_config_path
+        )
         changed = proofread_split_events(
             transcript,
             ctx,
