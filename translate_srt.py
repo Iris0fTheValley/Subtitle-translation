@@ -4722,11 +4722,7 @@ def merge_review_metadata(*values) -> dict:
 
 def persistent_event_review(value) -> dict:
     review = normalize_review_metadata(value)
-    persistent_categories = {"external_verification", "source_asr", "terminology"}
-    if any(
-        str(category).casefold() in persistent_categories
-        for category in review.get("categories", [])
-    ):
+    if review.get("needs_human", False):
         return review
     return {}
 

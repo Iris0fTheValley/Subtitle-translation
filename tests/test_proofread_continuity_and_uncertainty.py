@@ -503,6 +503,42 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertTrue(event.review["needs_human"])
         self.assertIn("专名尚无可靠证据", event.review["reasons"])
 
+    def test_uncategorized_human_review_roundtrips_and_survives_next_pass(self):
+        event = t.SplitEvent(
+            0.0,
+            1.0,
+            "Xylophar said hello.",
+            "赛洛法尔打了招呼。",
+            review={
+                "needs_human": True,
+                "reasons": ["专名仍需人工核验"],
+                "alternatives": ["西洛法尔"],
+                "note": "请对照片尾名单",
+            },
+        )
+        event = t.SplitEvent.from_json(event.to_json())
+        self.assertNotIn("categories", event.review)
+        self.assertTrue(event.review["needs_human"])
+
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+
+        def unchanged_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+            item = request.items[0]
+            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "edit": {}, "review": {}}]
+
+        with patch.object(t, "llm_numbered_batch", side_effect=unchanged_batch):
+            t.proofread_split_events(
+                transcript, self.ctx, FakeLLM(), "system", quiet=True, conservative=True
+            )
+
+        self.assertTrue(event.review["needs_human"])
+        self.assertIn("专名仍需人工核验", event.review["reasons"])
+        self.assertEqual(t.persistent_event_review({"needs_human": False}), {})
+
 
 if __name__ == "__main__":
     unittest.main()
