@@ -12,6 +12,7 @@ sentences back onto the timeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -268,6 +269,7 @@ class TranscriptContext:
     scenes_json: str
     scenechange_txt: str
     web_evidence_json: str
+    glossary_cache_json: str
 
     @staticmethod
     def from_json(
@@ -304,6 +306,7 @@ class TranscriptContext:
             scenes_json=os.path.join(directory, f"{base}.scenes.json"),
             scenechange_txt=os.path.join(directory, f"{base}.scenechange.txt"),
             web_evidence_json=os.path.join(directory, f"{base}.web_evidence.json"),
+            glossary_cache_json=os.path.join(directory, f"{base}.glossary-cache.json"),
         )
 
 
@@ -3614,6 +3617,75 @@ def local_glossary_markdown_from_evidence(request_fields: dict, sidecar: WebEvid
     return "\n".join(lines).rstrip() + "\n"
 
 
+def explicit_web_term_mappings(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> list[tuple[str, str, str]]:
+    """Extract only source terms explicitly paired with Chinese in evidence."""
+    transcript_text = "\n".join(segment.source_text() for segment in transcript.segments).casefold()
+    patterns = [
+        re.compile(
+            r"(?<![A-Za-z])"
+            r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
+            r"\s+[-–—]\s+"
+            r"([\u3400-\u9fff]{2,12})"
+        ),
+        re.compile(
+            r"(?<![A-Za-z])"
+            r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
+            r"\s*[（(]\s*"
+            r"([\u3400-\u9fff]{2,12})\s*[）)]"
+        ),
+    ]
+    mappings: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _, entry in sidecar.unique_entries():
+        for pattern in patterns:
+            for match in pattern.finditer(entry.content):
+                source = re.sub(r"\s+", " ", match.group(1)).strip()
+                target = match.group(2).strip()
+                key = (source.casefold(), target)
+                if source.isupper() or source.casefold() not in transcript_text or key in seen:
+                    continue
+                seen.add(key)
+                mappings.append((source, target, entry.url))
+    return mappings
+
+
+def merge_explicit_web_term_mappings(
+    glossary: str,
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> str:
+    """Append evidence-backed term mappings without rewriting model glossary text."""
+    base_glossary = re.sub(
+        r"\n*## 网页证据明确术语映射\s*\n.*?(?=\n##\s|\Z)",
+        "",
+        glossary.strip(),
+        flags=re.DOTALL,
+    ).rstrip()
+    mappings = [
+        mapping
+        for mapping in explicit_web_term_mappings(transcript, sidecar)
+        if not (mapping[0].casefold() in base_glossary.casefold() and mapping[1] in base_glossary)
+    ]
+    if not mappings:
+        return base_glossary
+    lines = [
+        base_glossary,
+        "",
+        "## 网页证据明确术语映射",
+        "| 原文术语 | 推荐译法 | 证据 |",
+        "|---|---|---|",
+    ]
+    for source, target, url in mappings:
+        safe_source = source.replace("|", "\\|")
+        safe_target = target.replace("|", "\\|")
+        safe_url = url.replace("|", "%7C")
+        lines.append(f"| {safe_source} | {safe_target} | {safe_url} |")
+    return "\n".join(lines).strip()
+
+
 def finalize_glossary_from_evidence(
     request_fields: dict,
     sidecar: WebEvidenceSidecar,
@@ -4822,8 +4894,9 @@ def proofread_split_events(
                     item_offset,
                     [[] for _ in batch_events],
                 )
-            print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-            response_items = []
+            else:
+                print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
+                response_items = []
 
         fallback_pairs = [(event.en, event.zh) for event in batch_events]
         parsed_pairs = parse_proofread_response(
