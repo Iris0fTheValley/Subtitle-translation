@@ -1686,18 +1686,10 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(
-                transcript,
-                self.ctx,
-                FakeBatchLLM(10),
-                "custom proofread",
-                quiet=True,
-                retriever=FakeRetriever(),
-                safety_mode=True,
-            )
+            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "custom proofread", quiet=True, retriever=FakeRetriever())
 
-        self.assertIn("explicitly states an exact old-form -> corrected-form replacement", captured["system_prompt"])
-        self.assertIn("Never infer a source correction from fluency", captured["system_prompt"])
+        self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
+        self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
         self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
 
     def test_runtime_proofread_prompt_adds_safety_not_language_policy(self):
@@ -1872,9 +1864,8 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
         self.assertTrue(changed)
-        self.assertEqual(saw_context[:2], [True, False])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one")
-        self.assertTrue(transcript.segments[0].split_events[0].review["needs_human"])
+        self.assertEqual(saw_context, [True, False])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
@@ -2183,7 +2174,6 @@ class JsonProtocolTests(unittest.TestCase):
         proofread_llm = t.proofread_llm_from_env(
             {
                 "PROOFREAD_BATCH_SIZE": "4",
-                "PROOFREAD_CONCURRENCY": "4",
                 "PROOFREAD_THINKING": "disabled",
                 "PROOFREAD_REASONING_EFFORT": "max",
             },
@@ -2192,7 +2182,6 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(proofread_llm.batch_size, 4)
-        self.assertEqual(t.proofread_concurrency_from_env({"PROOFREAD_CONCURRENCY": "4"}), 4)
         self.assertEqual(proofread_llm.request_overrides["extra_body"]["thinking"]["type"], "disabled")
         self.assertEqual(proofread_llm.request_overrides["reasoning_effort"], "max")
         self.assertNotIn("max_tokens", proofread_llm.request_overrides)
@@ -2212,7 +2201,6 @@ class JsonProtocolTests(unittest.TestCase):
             {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": "high"},
         )
         self.assertEqual(translate_llm.request_overrides, {})
-        self.assertEqual(t.proofread_concurrency_from_env({}), 1)
 
     def test_unknown_proofread_provider_does_not_receive_reasoning_parameters(self):
         translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", batch_size=12)

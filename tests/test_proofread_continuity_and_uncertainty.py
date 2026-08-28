@@ -701,6 +701,40 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertEqual(event.en, "Only Northwind Protocol works.")
         self.assertEqual(event.zh, "只有诺斯风协议有效。")
 
+    def test_sentence_group_retry_keeps_siblings_together_and_rolls_back_atomically(self):
+        first = t.SplitEvent(0.0, 1.0, "Only he can open it,", "只有他能打开，")
+        second = t.SplitEvent(1.0, 2.0, "He did not agree.", "他不同意。")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 2.0, "Only he can open it, He did not agree.", split_events=[first, second])],
+        )
+        calls = []
+
+        def fake_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+            ids = [item.id for item in request.items]
+            calls.append(ids)
+            if len(calls) == 1:
+                return [
+                    {"id": ids[0], "en": first.en, "zh": "只有他打得开，", "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["自然度"]}, "review": {}},
+                    {"id": ids[1], "en": second.en, "zh": "他同意。", "edit": {"source_changed": False, "target_changed": True, "categories": ["expression"], "reasons": ["调整表达"]}, "review": {}},
+                ]
+            return [
+                {"id": ids[0], "en": first.en, "zh": "只有他打得开，", "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["自然度"]}, "review": {}},
+                {"id": ids[1], "en": second.en, "zh": "他同意。", "edit": {"source_changed": False, "target_changed": True, "categories": ["expression"], "reasons": ["调整表达"]}, "review": {}},
+            ]
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            t.proofread_split_events(
+                transcript, self.ctx, FakeLLM(), "system", quiet=True, safety_mode=True
+            )
+
+        self.assertEqual(calls, [[1, 2], [1, 2]])
+        self.assertEqual(first.zh, "只有他能打开，")
+        self.assertEqual(second.zh, "他不同意。")
+        self.assertIn("proofread_sentence_group_rollback", first.review["categories"])
+        self.assertIn("proofread_sentence_group_rollback", second.review["categories"])
+
 
 if __name__ == "__main__":
     unittest.main()

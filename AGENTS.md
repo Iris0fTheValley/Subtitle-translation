@@ -88,6 +88,7 @@ winget install Microsoft.PowerShell
 ```text
 <base>.original.<ext> + <base>.mkv -> json -> beautified.json -> web_evidence.json + glossary.md
       -> split.<source>.srt / split.<target>.srt
+      -> human-review.json + proofread-report.md
       -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass
       -> burned.mkv
 ```
@@ -160,6 +161,7 @@ winget install Microsoft.PowerShell
 - 对轴时只用源语言 split 的首尾 token 匹配 `words[]`；匹配失败则整句回退到 beautified 时间轴，禁止本地强切
 - token normalize 会忽略词内 dash/hyphen，例如 `non-existent` 与 `nonexistent` 可匹配；带空格的 dash 仍作为分隔
 - `--no-split` 只跳过 AI 分割，仍会输出 SRT/ASS
+- 单视频内 proofread 纯串行；同一原句的 siblings 不拆分，按 sentence group 原子提交/回滚。定向 safety retry 仅对失败组执行一次，仍失败则整组回滚并写入人工复核与校对报告
 
 输出命名：
 
@@ -170,6 +172,8 @@ winget install Microsoft.PowerShell
 <base>.<target>.ass
 <base>.<source>-<target>.ass
 <base>.<target>.description
+<base>.human-review.json
+<base>.proofread-report.md
 ```
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名。输出文件后缀通过 `langcodes` 规范为 ISO 639 代码；未显式设置 `SOURCE_LANG` 时使用 WhisperX JSON 的 `language`，`TARGET_LANG` 默认 `zh`。
@@ -230,7 +234,7 @@ ${TARGET_LANG_CODE}
 
 proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `web_search.json` 的 `proofread_max_queries` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
 
-`PROOFREAD_BATCH_SIZE` 和 `PROOFREAD_CONCURRENCY` 分别控制单次请求大小与并发在途数；并发默认 `1` 以保持旧行为。未开启 thinking 时，部分模型会明显趋于保守并降低实际校对覆盖；开启 thinking 可提高问题发现与校对覆盖，但会增加 token、延迟和费用。当前仅已知支持这组请求参数的 DeepSeek 在变量留空时自动使用 `thinking=enabled` 与 `reasoning_effort=high`；能力未知或不支持的 provider 保持原默认且不发送专用参数。任一非空显式环境变量逐项覆盖自动值。thinking/reasoning 只深度合并到 proofread 请求，不影响 translate/glossary。报告计数用于可观测性，不得被作为 EDIT 数量或修改率目标。
+`PROOFREAD_BATCH_SIZE` 只控制单次串行校对请求大小；同一视频内的校对始终串行执行，且同一原句分割出的 siblings 不会被拆到不同请求。当前仅已知支持这组请求参数的 DeepSeek 在变量留空时自动使用 `thinking=enabled` 与 `reasoning_effort=high`；能力未知或不支持的 provider 不发送专用参数。任一非空显式环境变量逐项覆盖自动值。thinking/reasoning 只深度合并到 proofread 请求，不影响 translate/glossary。报告计数用于可观测性，不得被作为 EDIT 数量或修改率目标。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 

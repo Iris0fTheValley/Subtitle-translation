@@ -285,6 +285,8 @@ class TranscriptContext:
     scenechange_txt: str
     web_evidence_json: str
     glossary_cache_json: str
+    review_json: str
+    proofread_report_md: str
 
     @staticmethod
     def from_json(
@@ -322,6 +324,8 @@ class TranscriptContext:
             scenechange_txt=os.path.join(directory, f"{base}.scenechange.txt"),
             web_evidence_json=os.path.join(directory, f"{base}.web_evidence.json"),
             glossary_cache_json=os.path.join(directory, f"{base}.glossary-cache.json"),
+            review_json=os.path.join(directory, f"{base}.human-review.json"),
+            proofread_report_md=os.path.join(directory, f"{base}.proofread-report.md"),
         )
 
 
@@ -5268,8 +5272,9 @@ class ChatSession:
             if not isinstance(request_kwargs, dict):
                 raise ValueError("provider request_kwargs must be a JSON object")
             kwargs = deep_merge_dicts(kwargs, request_kwargs)
-        if self.llm.request_overrides:
-            kwargs = deep_merge_dicts(kwargs, self.llm.request_overrides)
+        request_overrides = getattr(self.llm, "request_overrides", {}) or {}
+        if request_overrides:
+            kwargs = deep_merge_dicts(kwargs, request_overrides)
         response_format = provider_cfg.get("response_format")
         if response_format and "response_format" not in kwargs:
             kwargs["response_format"] = response_format
@@ -5333,7 +5338,7 @@ class ChatSession:
         message = choice.message
         answer = message.content or ""
         finish_reason = str(getattr(choice, "finish_reason", "") or "").casefold()
-        if finish_reason in {"length", "max_tokens"}:
+        if answer and finish_reason in {"length", "max_tokens"}:
             raise LLMOutputLengthError(
                 "LLM output was truncated "
                 f"(provider={getattr(self.llm, 'provider', 'unknown')}, "
@@ -5910,7 +5915,7 @@ def llm_numbered_batch(
         )
         return data.to_items()
     except Exception as e:
-        if raise_on_failure and is_context_length_error(e):
+        if raise_on_failure and (is_context_length_error(e) or is_output_length_error(e)):
             raise
         message = f"LLM batch failed after {retries} attempts: {e}"
         if raise_on_failure:
@@ -5946,6 +5951,15 @@ def llm_numbered_batch_with_web_search(
         )
         choice = response.choices[0]
         message = choice.message
+        finish_reason = str(get_message_value(choice, "finish_reason", "") or "").casefold()
+        content = str(get_message_value(message, "content", "") or "")
+        if finish_reason in {"length", "max_tokens"}:
+            raise LLMOutputLengthError(
+                "LLM output was truncated "
+                f"(provider={getattr(session.llm, 'provider', 'unknown')}, "
+                f"model={session.llm.model_name()}, finish_reason={finish_reason}, "
+                f"content_chars={len(content)})"
+            )
         tool_calls = get_message_value(message, "tool_calls", None) or []
         if tool_calls:
             session.messages.append(assistant_message_to_json_value(message))
@@ -6098,16 +6112,22 @@ def proofread_split_events(
     search_runtime: Optional[WebSearchRuntime] = None,
     conservative: bool = False,
     safety_mode: Optional[bool] = None,
+    decision_records: Optional[list[dict]] = None,
 ) -> bool:
     safety_mode_enabled = conservative if safety_mode is None else safety_mode
     events: list[SplitEvent] = []
     review_hints: list[dict] = []
+    sentence_groups: list[tuple[list[SplitEvent], list[dict]]] = []
     for seg in transcript.segments:
-        segment_events = seg.split_events or [whole_segment_split_event(seg)]
+        if not seg.split_events:
+            seg.split_events = [whole_segment_split_event(seg)]
+        segment_events = seg.split_events
+        segment_review_hints = [
+            merge_review_metadata(seg.review, event.review) for event in segment_events
+        ]
         events.extend(segment_events)
-        review_hints.extend(
-            [merge_review_metadata(seg.review, event.review) for event in segment_events]
-        )
+        review_hints.extend(segment_review_hints)
+        sentence_groups.append((segment_events, segment_review_hints))
     if not events:
         return False
 
@@ -6167,6 +6187,7 @@ def proofread_split_events(
         item_offset: int,
         batch_contexts: list[list[dict]],
         batch_review_hints: list[dict],
+        batch_group_sizes: list[int],
     ) -> bool:
         nonlocal evidence_sidecar
         if search_runtime is not None:
@@ -6188,6 +6209,7 @@ def proofread_split_events(
             new_zh: str,
             guarded_review: dict,
             safety_events: list[str],
+            active_term_context: Optional[tuple[list[dict], list[dict]]] = None,
         ) -> tuple[str, str, dict]:
             """Apply the same deterministic post-gates to initial and retry candidates."""
             if breaks_cross_event_sentence_boundary(
@@ -6202,6 +6224,9 @@ def proofread_split_events(
                 new_en, new_zh, batch_contexts[index], ctx
             )
             if ui_target != new_zh:
+                term_constraints, term_conflicts = (
+                    active_term_context or batch_term_context[index]
+                )
                 _ui_source, new_zh, guarded_review = apply_proofread_safety_constraints(
                     new_en,
                     new_zh,
@@ -6214,8 +6239,8 @@ def proofread_split_events(
                         "reasons": ["deterministic glossary UI mapping"],
                     },
                     guarded_review,
-                    batch_term_context[index][0],
-                    batch_term_context[index][1],
+                    term_constraints,
+                    term_conflicts,
                     safety_mode=safety_mode_enabled,
                     safety_events=safety_events,
                     semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
@@ -6296,25 +6321,30 @@ def proofread_split_events(
                     e = None
             if e is None:
                 pass
-            elif len(batch_events) > 1 and is_context_length_error(e):
-                mid = len(batch_events) // 2
+            elif len(batch_group_sizes) > 1 and (
+                is_context_length_error(e) or is_output_length_error(e)
+            ):
+                group_mid = len(batch_group_sizes) // 2
+                event_mid = sum(batch_group_sizes[:group_mid])
                 if not quiet:
                     print(
-                        f"  Proofread batch too large; splitting {item_offset + 1}-"
-                        f"{item_offset + len(batch_events)}",
+                        f"  Proofread batch too large; splitting between sentence groups "
+                        f"{item_offset + event_mid}/{item_offset + event_mid + 1}",
                         file=sys.stderr,
                     )
                 left_changed = apply_proofread_batch(
-                    batch_events[:mid],
+                    batch_events[:event_mid],
                     item_offset,
-                    batch_contexts[:mid],
-                    batch_review_hints[:mid],
+                    batch_contexts[:event_mid],
+                    batch_review_hints[:event_mid],
+                    batch_group_sizes[:group_mid],
                 )
                 right_changed = apply_proofread_batch(
-                    batch_events[mid:],
-                    item_offset + mid,
-                    batch_contexts[mid:],
-                    batch_review_hints[mid:],
+                    batch_events[event_mid:],
+                    item_offset + event_mid,
+                    batch_contexts[event_mid:],
+                    batch_review_hints[event_mid:],
+                    batch_group_sizes[group_mid:],
                 )
                 return left_changed or right_changed
             elif is_context_length_error(e) and any(batch_contexts):
@@ -6328,10 +6358,31 @@ def proofread_split_events(
                     item_offset,
                     [[] for _ in batch_events],
                     batch_review_hints,
+                    batch_group_sizes,
                 )
             else:
                 print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-                response_items = []
+                category = (
+                    "proofread_output_length"
+                    if is_output_length_error(e)
+                    else "proofread_provider_error"
+                )
+                reason = (
+                    "校对模型输出耗尽，已保留原字幕"
+                    if is_output_length_error(e)
+                    else "校对请求失败，已保留原字幕"
+                )
+                for event in batch_events:
+                    event.review = merge_review_metadata(
+                        event.review,
+                        {
+                            "needs_human": True,
+                            "categories": [category],
+                            "reasons": [reason],
+                            "note": str(e)[:300],
+                        },
+                    )
+                return True
 
         fallback_pairs = [(event.en, event.zh) for event in batch_events]
         parsed_results = parse_proofread_results(
@@ -6361,6 +6412,21 @@ def proofread_split_events(
                 relevant_term_evidence(event.en, evidence_sidecar)
                 for event in batch_events
             ]
+        snapshots = [
+            (event.en, event.zh, event.original_en, copy.deepcopy(event.review))
+            for event in batch_events
+        ]
+        batch_decisions: list[str] = []
+        batch_records: list[dict] = []
+        group_bounds: list[tuple[int, int]] = []
+        item_group_indexes: list[int] = []
+        group_cursor = 0
+        for group_index, group_size in enumerate(batch_group_sizes):
+            group_bounds.append((group_cursor, group_cursor + group_size))
+            item_group_indexes.extend([group_index] * group_size)
+            group_cursor += group_size
+        group_retry_results: dict[int, dict[int, tuple[str, str, dict, Optional[dict]]]] = {}
+        group_retry_errors: dict[int, str] = {}
         batch_changed = False
         for index, (event, (en, zh, review, edit)) in enumerate(zip(batch_events, parsed_results)):
             candidate_en = en.strip() or event.en
@@ -6406,48 +6472,113 @@ def proofread_split_events(
                 normalized_review,
                 safety_events,
             )
+            initial_decision = decision
+            initial_reasons = list(diagnostic_reasons)
+            retry_attempted = False
+            retry_proposal_source = ""
+            retry_proposal_target = ""
+            retry_outcome = ""
+            retry_outcome_reasons: list[str] = []
+            retry_error_text = ""
             # One bounded retry is reserved for deterministic safety rollbacks.
             # It receives the exact same RAG, sentence context, and refreshed
             # terminology constraints as the rejected candidate.
             if decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
+                retry_attempted = True
                 retry_term_context = (
                     relevant_term_evidence(event.en, search_runtime.sidecar)
                     if search_runtime is not None
                     else batch_term_context[index]
                 )
-                retry_request = LLMBatchRequest([
-                    make_proofread_item(
-                        item_offset + index + 1,
-                        ctx,
-                        event.en,
-                        event.zh,
-                        retrieved_context=batch_contexts[index],
-                        review_hint=merge_review_metadata(
-                            batch_review_hints[index], normalized_review
-                        ),
-                        terminology_constraints=retry_term_context[0],
-                        evidence_conflicts=retry_term_context[1],
-                        sentence_context=sentence_contexts[item_offset + index],
-                        safety_retry={
-                            "attempt": 1,
-                            "first_proposal": LanguageFields.from_ctx(ctx).build(
-                                source=candidate_en, target=candidate_zh
-                            ),
-                            "gate_reasons": diagnostic_reasons,
-                        },
-                    )
-                ])
                 try:
-                    retry_items = llm_numbered_batch(
-                        retry_request,
-                        ChatSession(pr_llm, retry_system_prompt, temperature=0.2),
-                        quiet,
-                        retries=1,
-                        raise_on_failure=True,
-                    )
-                    retry_en, retry_zh, retry_review, retry_edit = parse_proofread_results(
-                        retry_items, [item_offset + index + 1], [(event.en, event.zh)], ctx
-                    )[0]
+                    group_index = item_group_indexes[index]
+                    group_start_index, group_end_index = group_bounds[group_index]
+                    if group_index not in group_retry_results and group_index not in group_retry_errors:
+                        retry_request = LLMBatchRequest([
+                            make_proofread_item(
+                                item_offset + sibling_index + 1,
+                                ctx,
+                                batch_events[sibling_index].en,
+                                batch_events[sibling_index].zh,
+                                retrieved_context=batch_contexts[sibling_index],
+                                review_hint=merge_review_metadata(
+                                    batch_review_hints[sibling_index],
+                                    normalized_review if sibling_index == index else {},
+                                ),
+                                terminology_constraints=(
+                                    relevant_term_evidence(
+                                        batch_events[sibling_index].en,
+                                        search_runtime.sidecar,
+                                    )
+                                    if search_runtime is not None
+                                    else batch_term_context[sibling_index]
+                                )[0],
+                                evidence_conflicts=(
+                                    relevant_term_evidence(
+                                        batch_events[sibling_index].en,
+                                        search_runtime.sidecar,
+                                    )
+                                    if search_runtime is not None
+                                    else batch_term_context[sibling_index]
+                                )[1],
+                                sentence_context=sentence_contexts[item_offset + sibling_index],
+                                safety_retry={
+                                    "attempt": 1,
+                                    "group_item_ids": [
+                                        item_offset + value + 1
+                                        for value in range(group_start_index, group_end_index)
+                                    ],
+                                    "first_proposal": LanguageFields.from_ctx(ctx).build(
+                                        source=(parsed_results[sibling_index][0].strip() or batch_events[sibling_index].en),
+                                        target=(parsed_results[sibling_index][1].strip() or batch_events[sibling_index].zh),
+                                    ),
+                                    "gate_reasons": diagnostic_reasons if sibling_index == index else [],
+                                },
+                            )
+                            for sibling_index in range(group_start_index, group_end_index)
+                        ])
+                        retry_items = llm_numbered_batch(
+                            retry_request,
+                            ChatSession(
+                                pr_llm,
+                                retry_system_prompt,
+                                temperature=0.2,
+                                disable_provider_search=True,
+                            ),
+                            quiet,
+                            retries=1,
+                            raise_on_failure=True,
+                        )
+                        expected_ids = [
+                            item_offset + sibling_index + 1
+                            for sibling_index in range(group_start_index, group_end_index)
+                        ]
+                        actual_ids = sorted(
+                            int(item.get("id"))
+                            for item in retry_items
+                            if isinstance(item, dict) and str(item.get("id", "")).isdigit()
+                        )
+                        if actual_ids != expected_ids or len(retry_items) != len(expected_ids):
+                            raise ValueError(
+                                f"proofread safety retry ids {actual_ids} do not exactly match {expected_ids}"
+                            )
+                        parsed_retry_items = parse_proofread_results(
+                            retry_items,
+                            expected_ids,
+                            [
+                                (batch_events[value].en, batch_events[value].zh)
+                                for value in range(group_start_index, group_end_index)
+                            ],
+                            ctx,
+                        )
+                        group_retry_results[group_index] = dict(zip(expected_ids, parsed_retry_items))
+                    if group_index in group_retry_errors:
+                        raise RuntimeError(group_retry_errors[group_index])
+                    retry_en, retry_zh, retry_review, retry_edit = group_retry_results[group_index][
+                        item_offset + index + 1
+                    ]
+                    retry_proposal_source = retry_en.strip() or event.en
+                    retry_proposal_target = retry_zh.strip() or event.zh
                     retry_events: list[str] = []
                     new_en, new_zh, guarded_review = apply_proofread_safety_constraints(
                         event.en, event.zh,
@@ -6470,6 +6601,8 @@ def proofread_split_events(
                         retry_en.strip() or event.en, retry_zh.strip() or event.zh,
                         new_en, new_zh, normalized_review, retry_events,
                     )
+                    retry_outcome = retry_decision
+                    retry_outcome_reasons = list(retry_reasons)
                     if retry_decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
                         new_en, new_zh = event.en, event.zh
                         decision, diagnostic_reasons = retry_decision, retry_reasons
@@ -6487,6 +6620,9 @@ def proofread_split_events(
                     else:
                         decision, diagnostic_reasons = retry_decision, retry_reasons
                 except Exception as retry_error:
+                    if 'group_index' in locals():
+                        group_retry_errors[group_index] = str(retry_error)
+                    retry_error_text = str(retry_error)
                     new_en, new_zh = event.en, event.zh
                     decision = "EDIT_ROLLED_BACK"
                     diagnostic_reasons = unique_non_empty_strings(
@@ -6507,6 +6643,7 @@ def proofread_split_events(
                     f"    Proofread item {item_offset + index + 1}: {decision}{detail}",
                     file=sys.stderr,
                 )
+            batch_decisions.append(decision)
             if new_en != event.en or new_zh != event.zh or normalized_review != event.review:
                 batch_changed = True
             if new_en != event.en and not event.original_en:
@@ -6514,11 +6651,84 @@ def proofread_split_events(
             event.en = new_en
             event.zh = new_zh
             event.review = normalized_review
+            batch_records.append(
+                {
+                    "item_id": item_offset + index + 1,
+                    "start": round(event.start, 3),
+                    "end": round(event.end, 3),
+                    "original_source": snapshots[index][0],
+                    "original_target": snapshots[index][1],
+                    "first_proposal_source": candidate_en,
+                    "first_proposal_target": candidate_zh,
+                    "first_decision": initial_decision,
+                    "first_gate_reasons": initial_reasons,
+                    "retry_attempted": retry_attempted,
+                    "retry_proposal_source": retry_proposal_source,
+                    "retry_proposal_target": retry_proposal_target,
+                    "retry_decision": retry_outcome,
+                    "retry_gate_reasons": retry_outcome_reasons,
+                    "retry_error": retry_error_text,
+                    "final_decision": decision,
+                    "final_source": event.en,
+                    "final_target": event.zh,
+                    "review": normalize_review_metadata(event.review),
+                }
+            )
+
+        group_start = 0
+        for group_size in batch_group_sizes:
+            group_end = group_start + group_size
+            if any(
+                decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}
+                for decision in batch_decisions[group_start:group_end]
+            ):
+                for local_index in range(group_start, group_end):
+                    event = batch_events[local_index]
+                    original_en, original_zh, original_original_en, original_review = snapshots[local_index]
+                    event.en = original_en
+                    event.zh = original_zh
+                    event.original_en = original_original_en
+                    event.review = merge_review_metadata(
+                        event.review,
+                        {
+                            "needs_human": True,
+                            "categories": ["proofread_sentence_group_rollback"],
+                            "reasons": ["同一原句内有 sibling 未通过安全门，整组已原子回滚"],
+                        },
+                    )
+                    batch_records[local_index]["final_decision"] = "EDIT_ROLLED_BACK"
+                    batch_records[local_index]["final_source"] = event.en
+                    batch_records[local_index]["final_target"] = event.zh
+                    batch_records[local_index]["review"] = normalize_review_metadata(event.review)
+                batch_changed = True
+            group_start = group_end
+        if decision_records is not None:
+            decision_records.extend(batch_records)
         return batch_changed
 
-    for start in range(0, len(events), pr_llm.batch_size):
-        batch = events[start : start + pr_llm.batch_size]
-        batch_review_hints = review_hints[start : start + pr_llm.batch_size]
+    packed_groups: list[list[tuple[list[SplitEvent], list[dict]]]] = []
+    current_groups: list[tuple[list[SplitEvent], list[dict]]] = []
+    current_size = 0
+    for group in sentence_groups:
+        group_size = len(group[0])
+        if current_groups and current_size + group_size > pr_llm.batch_size:
+            packed_groups.append(current_groups)
+            current_groups = []
+            current_size = 0
+        current_groups.append(group)
+        current_size += group_size
+        if current_size >= pr_llm.batch_size:
+            packed_groups.append(current_groups)
+            current_groups = []
+            current_size = 0
+    if current_groups:
+        packed_groups.append(current_groups)
+
+    start = 0
+    for batch_number, packed in enumerate(packed_groups, start=1):
+        batch = [event for group, _hints in packed for event in group]
+        batch_review_hints = [hint for _group, hints in packed for hint in hints]
+        batch_group_sizes = [len(group) for group, _hints in packed]
         contexts = (
             retriever.retrieve_texts(
                 [proofread_retrieval_query(event) for event in batch],
@@ -6529,11 +6739,18 @@ def proofread_split_events(
         )
         if not quiet:
             print(
-                f"  Batch {start // pr_llm.batch_size + 1}/{math.ceil(len(events) / pr_llm.batch_size)}: "
+                f"  Batch {batch_number}/{len(packed_groups)}: "
                 f"proofreading split events {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        changed = apply_proofread_batch(batch, start, contexts, batch_review_hints) or changed
+        changed = apply_proofread_batch(
+            batch,
+            start,
+            contexts,
+            batch_review_hints,
+            batch_group_sizes,
+        ) or changed
+        start += len(batch)
     if search_runtime is not None and search_runtime.sidecar.has_evidence():
         search_runtime.sidecar = enrich_confirmed_term_evidence(
             transcript, search_runtime.sidecar,
@@ -7104,6 +7321,97 @@ def all_events(transcript: Transcript) -> list[SplitEvent]:
     return events
 
 
+def write_human_review_sidecar(ctx: TranscriptContext, transcript: Transcript) -> str:
+    """Persist review flags without changing rendered subtitle text."""
+    items: list[dict] = []
+    for segment in transcript.segments:
+        translation_review = normalize_review_metadata(segment.review)
+        event_reviews = []
+        for event in segment.split_events:
+            review = normalize_review_metadata(event.review)
+            if review:
+                event_reviews.append(
+                    {
+                        "start": round(event.start, 3),
+                        "end": round(event.end, 3),
+                        "source": event.en,
+                        "translation": event.zh,
+                        "proofread_review": review,
+                    }
+                )
+        if not translation_review and not event_reviews:
+            continue
+        item = {
+            "segment_id": segment.index,
+            "start": round(segment.start, 3),
+            "end": round(segment.end, 3),
+            "source": segment.source_text(),
+            "translation": segment.translation,
+        }
+        if translation_review:
+            item["translation_review"] = translation_review
+        if event_reviews:
+            item["event_reviews"] = event_reviews
+        items.append(item)
+    with open(ctx.review_json, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "format": "subtitle-human-review",
+                "instructions": "人工检查 translation_review / event_reviews；这些标记不会写入 ASS 或 SRT 字幕。",
+                "items": items,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+        handle.write("\n")
+    return ctx.review_json
+
+
+def markdown_cell(value) -> str:
+    return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
+
+
+def write_proofread_report(ctx: TranscriptContext, records: list[dict]) -> str:
+    """Persist deterministic proofread decisions for operator review."""
+    counts = {
+        label: sum(1 for record in records if record.get("final_decision") == label)
+        for label in ("KEEP_BY_MODEL", "EDIT_APPLIED", "REVIEW_BY_MODEL", "EDIT_ROLLED_BACK")
+    }
+    lines = [
+        f"# Proofread report: {ctx.base}",
+        "",
+        "- Execution: serial",
+        f"- Final KEEP: {counts['KEEP_BY_MODEL']}",
+        f"- Final EDIT_APPLIED: {counts['EDIT_APPLIED']}",
+        f"- Final REVIEW: {counts['REVIEW_BY_MODEL']}",
+        f"- Final ROLLBACK: {counts['EDIT_ROLLED_BACK']}",
+        f"- Safety retries: {sum(1 for record in records if record.get('retry_attempted'))}",
+        "",
+        "| Item | Time | Initial | Retry | Final | Gate reasons |",
+        "|---:|---|---|---|---|---|",
+    ]
+    for record in records:
+        reasons = unique_non_empty_strings(
+            [*record.get("first_gate_reasons", []), *record.get("retry_gate_reasons", [])],
+            24,
+        )
+        lines.append(
+            "| {item} | {start:.3f}–{end:.3f} | {initial} | {retry} | {final} | {reasons} |".format(
+                item=record.get("item_id", ""),
+                start=float(record.get("start", 0.0)),
+                end=float(record.get("end", 0.0)),
+                initial=markdown_cell(record.get("first_decision", "")),
+                retry=markdown_cell(record.get("retry_decision", "") or "—"),
+                final=markdown_cell(record.get("final_decision", "")),
+                reasons=markdown_cell(", ".join(reasons)),
+            )
+        )
+    with open(ctx.proofread_report_md, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+    return ctx.proofread_report_md
+
+
 @dataclass(frozen=True)
 class AssTrack:
     field_name: str
@@ -7467,6 +7775,7 @@ def main() -> None:
             warning_label="translation memory index update failed",
         )
         retriever = updated_retriever or retriever
+    proofread_decisions: list[dict] = []
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         enhanced_proofread = explicit_proofread_model_configured(env)
@@ -7484,9 +7793,12 @@ def main() -> None:
             enhanced=enhanced_proofread,
             search_runtime=proofread_search_runtime,
             safety_mode=True,
+            decision_records=proofread_decisions,
         ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)
+    review_path = write_human_review_sidecar(ctx, transcript)
+    proofread_report_path = write_proofread_report(ctx, proofread_decisions)
 
     if not os.path.isfile(template_path):
         print(f"Error: template.ass not found: {template_path}", file=sys.stderr)
@@ -7508,10 +7820,14 @@ def main() -> None:
         print(f"ASS:      {ctx.proofread_ass}")
         print(f"          {ctx.target_ass}")
         print(f"          {ctx.bilingual_ass}")
+        print(f"Human review: {review_path}")
+        print(f"Proofread report: {proofread_report_path}")
         print(f"Events:   {len(events)}")
     else:
         print(ctx.bilingual_ass)
     print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
+    print(f"HUMAN_REVIEW={os.path.abspath(review_path)}")
+    print(f"PROOFREAD_REPORT={os.path.abspath(proofread_report_path)}")
 
 
 if __name__ == "__main__":

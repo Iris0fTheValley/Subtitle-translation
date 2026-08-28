@@ -77,6 +77,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ```text
 <name>.original.<ext> + <name>.mkv -> <name>.json -> <name>.beautified.json
 -> <name>.web_evidence.json + glossary.md
+-> <name>.human-review.json + <name>.proofread-report.md
 -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```
 
@@ -114,6 +115,8 @@ bash "<repo>/merge_ass.sh" "video.zh.ass" "video.en.ass"
 - `<name>.scenes.json`：场景切换 sidecar，包含 fps、threshold、frame、timecode 等调试信息
 - `<name>.scenechange.txt`：每行一个秒级场景切换点，例如 `12.345000`
 - `<name>.web_evidence.json`：联网证据 sidecar，保存规范化 query、provider、域名、URL、标题和证据摘要，用于 embedding 检索
+- `<name>.human-review.json`：需要人工核验的 translation / proofread 标记，不污染字幕文本
+- `<name>.proofread-report.md`：串行校对的初始决策、safety retry、最终提交或回滚报告
 - `<name>.split.<source>.srt`：分割后、最终校对后的源语言 SRT 检查稿
 - `<name>.split.<target>.srt`：分割后、最终校对后的目标语言 SRT 检查稿
 - `<name>.<source>.proofread.ass`：最终校对源语言 ASS
@@ -182,6 +185,8 @@ DEEPSEEK_API_KEY=
 证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`web_search.json` 的 `proofread_max_queries` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。glossary 是主要研究阶段，但 proofread 保留针对候选 ASR/术语疑点的按需联网核验；当轮新证据会先 enrich 后再进入 candidate safety evaluation。
 
 校对 safety 分为语言无关和语言专用两层：ID 完整性、时间轴不变、术语约束、sentence-group 原子性与证据冲突处理始终启用；当前语义锚点词表仅覆盖 English→Chinese，其他语言方向会显式跳过该语言专用 gate，仍保留全部通用检查。
+
+同一原句分割出的 siblings 始终作为一个事务组请求和提交；任一 sibling 在最多一次定向 safety retry 后仍失败，整组回滚并写入 human review/report。输入或输出长度恢复只在完整句组边界拆分请求，不拆开 siblings。
 
 `PROOFREAD_BATCH_SIZE` 控制单次串行校对请求包含多少字幕。未开启 thinking 时，部分模型的校对会明显趋于保守；开启 thinking 可提高问题发现与校对覆盖，但会增加 token、延迟和费用。当前仅对已知支持这组请求参数的 DeepSeek 校对自动使用 `PROOFREAD_THINKING=enabled` 与 `PROOFREAD_REASONING_EFFORT=high`；能力未知或不支持的 provider 不发送专用参数。任一非空显式环境变量始终覆盖对应自动值。thinking/reasoning 只作用于 proofreading，不影响首译或 glossary。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是 EDIT 数量或修改率目标。
 
