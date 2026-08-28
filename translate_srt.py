@@ -6158,7 +6158,8 @@ def proofread_split_events(
         + proofread_format
     )
     retry_system_prompt = proofread_system_prompt + "\n\n" + (
-        "SAFETY RETRY: return one safe revision for the current item only. "
+        "SAFETY RETRY: return one safe revision for each supplied item in the current "
+        "sentence group only, with exactly one JSON item for every supplied id. "
         "Preserve valid improvements, repair the listed deterministic gate reasons, "
         "and keep the supplied sentence_context, evidence, and terminology constraints."
     )

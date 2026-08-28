@@ -710,8 +710,9 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
             [t.TranscriptSegment(1, 0.0, 2.0, "Only he can open it, He did not agree.", split_events=[first, second])],
         )
         calls = []
+        retry_snapshot = {}
 
-        def fake_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+        def fake_batch(request, session, _quiet, retries=3, raise_on_failure=False):
             ids = [item.id for item in request.items]
             calls.append(ids)
             if len(calls) == 1:
@@ -719,6 +720,10 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
                     {"id": ids[0], "en": first.en, "zh": "只有他打得开，", "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["自然度"]}, "review": {}},
                     {"id": ids[1], "en": second.en, "zh": "他同意。", "edit": {"source_changed": False, "target_changed": True, "categories": ["expression"], "reasons": ["调整表达"]}, "review": {}},
                 ]
+            self.assertEqual(retries, 1)
+            self.assertTrue(raise_on_failure)
+            retry_snapshot["system_prompt"] = session.system_prompt
+            retry_snapshot["request"] = request.to_json_value()
             return [
                 {"id": ids[0], "en": first.en, "zh": "只有他打得开，", "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["自然度"]}, "review": {}},
                 {"id": ids[1], "en": second.en, "zh": "他同意。", "edit": {"source_changed": False, "target_changed": True, "categories": ["expression"], "reasons": ["调整表达"]}, "review": {}},
@@ -730,6 +735,12 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
             )
 
         self.assertEqual(calls, [[1, 2], [1, 2]])
+        self.assertIn("each supplied item in the current sentence group only", retry_snapshot["system_prompt"])
+        self.assertIn("exactly one JSON item for every supplied id", retry_snapshot["system_prompt"])
+        retry_items = retry_snapshot["request"]["items"]
+        self.assertEqual([item["id"] for item in retry_items], [1, 2])
+        self.assertEqual(retry_items[0]["safety_retry"]["group_item_ids"], [1, 2])
+        self.assertEqual(retry_items[1]["safety_retry"]["group_item_ids"], [1, 2])
         self.assertEqual(first.zh, "只有他能打开，")
         self.assertEqual(second.zh, "他不同意。")
         self.assertIn("proofread_sentence_group_rollback", first.review["categories"])
