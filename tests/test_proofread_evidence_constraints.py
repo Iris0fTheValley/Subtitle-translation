@@ -180,8 +180,10 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
                 )
 
         self.assertEqual(captured["items"][0]["terminology_constraints"][0]["target"], "诺斯风协议")
-        self.assertFalse(changed)
+        self.assertTrue(changed)
         self.assertEqual(event.zh, "诺斯风协议失败了。")
+        self.assertTrue(event.review["needs_human"])
+        self.assertIn("proofread_safety_retry", event.review["categories"])
 
     def test_same_round_web_mapping_is_enriched_before_candidate_safety(self):
         class FakeLLM:

@@ -6289,7 +6289,9 @@ def proofread_split_events(
                         event.en,
                         event.zh,
                         retrieved_context=batch_contexts[index],
-                        review_hint=batch_review_hints[index],
+                        review_hint=merge_review_metadata(
+                            batch_review_hints[index], normalized_review
+                        ),
                         terminology_constraints=batch_term_context[index][0],
                         evidence_conflicts=batch_term_context[index][1],
                         sentence_context=sentence_contexts[item_offset + index],
@@ -6337,10 +6339,26 @@ def proofread_split_events(
                     )
                     if retry_decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
                         new_en, new_zh = event.en, event.zh
+                        decision, diagnostic_reasons = retry_decision, retry_reasons
+                        normalized_review = merge_review_metadata(
+                            normalized_review,
+                            {
+                                "needs_human": True,
+                                "categories": ["proofread_safety_retry"],
+                                "reasons": [
+                                    "定向安全重试仍未通过，已回滚并请求人工核验",
+                                    *diagnostic_reasons,
+                                ],
+                            },
+                        )
                     else:
                         decision, diagnostic_reasons = retry_decision, retry_reasons
                 except Exception as retry_error:
                     new_en, new_zh = event.en, event.zh
+                    decision = "EDIT_ROLLED_BACK"
+                    diagnostic_reasons = unique_non_empty_strings(
+                        [*diagnostic_reasons, "proofread_safety_retry_error"], 12
+                    )
                     normalized_review = merge_review_metadata(
                         normalized_review,
                         {

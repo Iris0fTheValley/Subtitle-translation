@@ -615,6 +615,8 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
 
         self.assertEqual(calls, 2)
         self.assertEqual(event.zh, "只有他能打开。")
+        self.assertTrue(event.review["needs_human"])
+        self.assertIn("proofread_safety_retry", event.review["categories"])
 
     def test_partially_applied_edit_gets_one_retry_with_the_same_evidence(self):
         event = t.SplitEvent(
