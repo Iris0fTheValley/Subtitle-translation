@@ -39,10 +39,10 @@ platform: Agent + Script
 
 联网搜索：
 
-- `WEB_SEARCH_PROVIDER=auto/tavily/exa` 选择搜索后端；配置对应的 `TAVILY_API_KEY` 或 `EXA_API_KEY` 后才可发起新网络请求
-- `TAVILY_MAX_RESULTS` / `EXA_MAX_RESULTS` 控制对应后端的单次结果上限
+- `web_search.json` 选择搜索后端与预算：`provider=auto/tavily/exa`、统一 `max_results`、`glossary_max_queries`、`proofread_max_queries`
+- 环境变量只保留 `TAVILY_API_KEY` / `EXA_API_KEY`；配置对应 key 后才可发起新网络请求
 - glossary 默认在同一个 ChatSession 中使用搜索 tool calls；脚本执行 provider 搜索后把 tool result 回喂同一 session
-- `GLOSSARY_SEARCH_MAX_QUERIES` 是 glossary 新网络查询预算，默认 15，优先于兼容变量 `TAVILY_MAX_QUERIES`；设为 0 时禁止新请求，但已有 sidecar evidence 仍可读取和复用
+- `web_search.json` 的 `glossary_max_queries` 是 glossary 新网络查询预算，默认 15；设为 0 时禁止新请求，但已有 sidecar evidence 仍可读取和复用
 - glossary 阶段会强制移除 provider 的 JSON mode `response_format`，避免干扰 tool calling；最终仍要求返回 JSON object
 - 第一轮会把合并后的 `tavily_domains.json` 域名偏好喂给模型
 - `tavily_domains.json` 维护全局百科域名和视频题材相关站点；脚本会根据 metadata、模型给出的 query / `topic_hints` 选择站点，先用 `include_domains` 搜索，结果不足再普通搜索
