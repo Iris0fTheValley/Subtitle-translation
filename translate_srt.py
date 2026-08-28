@@ -121,6 +121,8 @@ class SplitEvent:
     end: float
     en: str
     zh: str
+    review: dict = field(default_factory=dict)
+    original_en: str = ""
 
     @staticmethod
     def from_json(data: dict) -> "SplitEvent":
@@ -129,15 +131,22 @@ class SplitEvent:
             end=float(data.get("end", 0.0)),
             en=str(data.get("en", "")),
             zh=str(data.get("zh", "")),
+            review=normalize_review_metadata(data.get("review", {})),
+            original_en=str(data.get("original_en", "")).strip(),
         )
 
     def to_json(self) -> dict:
-        return {
+        data = {
             "start": round(self.start, 3),
             "end": round(self.end, 3),
             "en": self.en,
             "zh": self.zh,
         }
+        if self.review:
+            data["review"] = self.review
+        if self.original_en and self.original_en != self.en:
+            data["original_en"] = self.original_en
+        return data
 
 
 @dataclass
@@ -155,6 +164,7 @@ class TranscriptSegment:
     split_reason_detail: str = ""
     original_start: Optional[float] = None
     original_end: Optional[float] = None
+    review: dict = field(default_factory=dict)
 
     @staticmethod
     def from_json(index: int, data: dict) -> "TranscriptSegment":
@@ -176,6 +186,7 @@ class TranscriptSegment:
             words=words,
             proofread_text=str(data.get("proofread_text", "")).strip(),
             translation=str(data.get("translation", "")).strip(),
+            review=normalize_review_metadata(data.get("review", {})),
             split_events=events,
             split_status=SplitStatus.normalize(str(data.get("split_status", ""))),
             split_reason=SplitReason.normalize(str(data.get("split_reason", ""))),
@@ -206,6 +217,8 @@ class TranscriptSegment:
             data["proofread_text"] = self.proofread_text
         if self.translation:
             data["translation"] = self.translation
+        if self.review:
+            data["review"] = self.review
         if self.split_events:
             data["split_events"] = [e.to_json() for e in self.split_events]
         if self.split_status:
@@ -4463,49 +4476,6 @@ def build_glossary(
         all_evidence = merge_web_evidence_sidecars(all_evidence, sidecar)
         if all_evidence.has_evidence():
             write_web_evidence_sidecar(ctx, all_evidence)
-        glossary = write_glossary_file(
-            ctx,
-            merge_explicit_web_term_mappings(
-                glossary, transcript, sidecar, ctx.source_lang_code, ctx.target_lang_code
-            ),
-        ) or glossary
-
-        fingerprint = glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar)
-        cache_metadata = load_glossary_cache_metadata(ctx)
-        cache_current = (
-            cache_metadata.get("version") == GLOSSARY_CACHE_VERSION
-            and cache_metadata.get("fingerprint") == fingerprint
-        )
-        if sidecar.has_records() and not cache_current:
-            if not options.quiet:
-                print("Glossary cache: evidence changed; reconciling cached terms", file=sys.stderr)
-            request_fields = build_glossary_request_fields(
-                transcript,
-                ctx,
-                GlossaryRequestArgs(metadata_fields=metadata_fields, retriever=options.retriever),
-            )
-            request_fields["existing_glossary"] = glossary
-            artifact = finalize_glossary_from_evidence(
-                request_fields,
-                sidecar,
-                ctx,
-                llm,
-                options,
-            )
-            sidecar = merge_web_evidence_sidecars(sidecar, artifact.web_evidence)
-            all_evidence = merge_web_evidence_sidecars(all_evidence, sidecar)
-            write_web_evidence_sidecar(ctx, all_evidence)
-            refreshed = write_glossary_file(
-                ctx,
-                merge_explicit_web_term_mappings(
-                    ensure_local_metadata_in_glossary(artifact.markdown, ctx),
-                    transcript,
-                    sidecar,
-                    ctx.source_lang_code,
-                    ctx.target_lang_code,
-                ),
-            )
-            glossary = refreshed or glossary
         fingerprint = glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar)
         write_glossary_cache_metadata(ctx, fingerprint)
         if not options.quiet:
@@ -5390,6 +5360,86 @@ def proofread_retrieval_query(event: SplitEvent) -> str:
             f"Source: {event.en}",
             f"Target: {event.zh}",
         ]
+    )
+
+
+def apply_glossary_ui_translation(
+    source_text: str,
+    translated_text: str,
+    retrieved_context: list[dict],
+    ctx: TranscriptContext,
+) -> str:
+    if not ctx.target_lang_code.lower().startswith("zh"):
+        return translated_text
+    match = re.fullmatch(
+        r"\s*([A-Z][A-Za-z0-9'’]*(?:\s+[A-Z][A-Za-z0-9'’]*){0,4})"
+        r"\s*(?:[-:–—]\s*)?"
+        r"(impossible|success|succeeded|failure|failed|easy|medium|hard)\s*[.!]?\s*",
+        source_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return translated_text
+    source_label, raw_status = match.groups()
+    target_label = ""
+    mapping_pattern = re.compile(
+        rf"\|\s*{re.escape(source_label)}\s*\|\s*([^|\n]+)",
+        flags=re.IGNORECASE,
+    )
+    for item in retrieved_context:
+        mapping = mapping_pattern.search(str(item.get("text", "")))
+        if mapping:
+            target_label = mapping.group(1).strip().removesuffix("(?)").strip()
+            break
+    if not target_label:
+        return translated_text
+    statuses = {
+        "impossible": "不可能",
+        "success": "成功",
+        "succeeded": "成功",
+        "failure": "失败",
+        "failed": "失败",
+        "easy": "简单",
+        "medium": "中等",
+        "hard": "困难",
+    }
+    return f"[{target_label}]：{statuses[raw_status.casefold()]}"
+
+
+def merge_retrieval_review_evidence(
+    source_text: str,
+    review: dict,
+    retrieved_context: list[dict],
+) -> dict:
+    normalized_source = tavily_query_dedupe_key(source_text)
+    if not normalized_source:
+        return normalize_review_metadata(review)
+    evidence_hit = False
+    for item in retrieved_context:
+        evidence = str(item.get("text", ""))
+        normalized_evidence = tavily_query_dedupe_key(evidence)
+        if (
+            normalized_source in normalized_evidence
+            and "asr" in evidence.casefold()
+            and any(marker in evidence for marker in ("疑似", "破损", "误听", "需结合", "需确认", "(?)"))
+        ):
+            evidence_hit = True
+            break
+    normalized = normalize_review_metadata(review)
+    if not evidence_hit:
+        return normalized
+    categories = unique_non_empty_strings([*(normalized.get("categories", [])), "source_ASR"], 8)
+    reasons = unique_non_empty_strings(
+        [*(normalized.get("reasons", [])), "项目知识库将当前源文标记为疑似 ASR，需对照音频或画面确认"],
+        8,
+    )
+    return normalize_review_metadata(
+        {
+            **normalized,
+            "needs_human": True,
+            "categories": categories,
+            "reasons": reasons,
+        }
     )
 
 
