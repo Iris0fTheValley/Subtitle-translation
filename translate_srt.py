@@ -6283,7 +6283,7 @@ def proofread_split_events(
             # terminology constraints as the rejected candidate.
             if decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
                 retry_request = LLMBatchRequest([
-                    make_pair_item(
+                    make_proofread_item(
                         item_offset + index + 1,
                         ctx,
                         event.en,
