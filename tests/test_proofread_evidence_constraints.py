@@ -127,7 +127,7 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
             "Northwind Protocol was restored.", sidecar
         )
         ctx = t.TranscriptContext.from_json("sample.json", "", "en", "zh")
-        item = t.make_pair_item(
+        item = t.make_proofread_item(
             1,
             ctx,
             "Northwind Protocol was restored.",

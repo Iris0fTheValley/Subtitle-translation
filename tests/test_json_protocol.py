@@ -262,6 +262,10 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(data["zh"], "current target")
         self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
         self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
+        self.assertNotIn("translation_review", data)
+        self.assertNotIn("terminology_constraints", data)
+        self.assertNotIn("evidence_conflicts", data)
+        self.assertNotIn("sentence_context", data)
 
     def test_typed_proofread_result_parses_language_values(self):
         result = t.LanguageTextResult.from_json_value(
@@ -272,12 +276,16 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.target_text, "corrected target")
 
     def test_typed_proofread_item_serializes_retrieved_context(self):
-        item = t.make_pair_item(
+        item = t.make_proofread_item(
             3,
             self.ctx,
             "source text",
             "target text",
             retrieved_context=[{"id": "transcript:2", "text": "nearby context"}],
+            review_hint={"needs_human": True, "categories": ["timing"], "reasons": ["check split"]},
+            terminology_constraints=[{"source": "Northwind", "target": "北风", "source_variants": []}],
+            evidence_conflicts=[{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+            sentence_context={"current_part": 1, "part_count": 2},
         )
         self.assertEqual(
             item.to_json_value(),
@@ -286,6 +294,14 @@ class JsonProtocolTests(unittest.TestCase):
                 "en": "source text",
                 "zh": "target text",
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
+                "translation_review": {
+                    "needs_human": True,
+                    "categories": ["timing"],
+                    "reasons": ["check split"],
+                },
+                "terminology_constraints": [{"source": "Northwind", "target": "北风"}],
+                "evidence_conflicts": [{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+                "sentence_context": {"current_part": 1, "part_count": 2},
             },
         )
 

@@ -4890,6 +4890,27 @@ def make_pair_item(
     retrieved_context: Optional[list[dict]] = None,
     context_before: Optional[list[dict]] = None,
     context_after: Optional[list[dict]] = None,
+) -> LLMBatchItem:
+    extra = {"retrieved_context": retrieved_context or []}
+    if context_before:
+        extra["context_before"] = context_before
+    if context_after:
+        extra["context_after"] = context_after
+    return make_language_item(
+        item_id,
+        ctx,
+        source=source_text,
+        target=target_text,
+        extra=extra,
+    )
+
+
+def make_proofread_item(
+    item_id: int,
+    ctx: TranscriptContext,
+    source_text: str,
+    target_text: str,
+    retrieved_context: Optional[list[dict]] = None,
     review_hint: Optional[dict] = None,
     terminology_constraints: Optional[list[dict]] = None,
     evidence_conflicts: Optional[list[dict]] = None,
@@ -4904,10 +4925,6 @@ def make_pair_item(
     normalized_review = normalize_review_metadata(review_hint or {})
     if normalized_review:
         extra["translation_review"] = normalized_review
-    if context_before:
-        extra["context_before"] = context_before
-    if context_after:
-        extra["context_after"] = context_after
     return make_language_item(
         item_id,
         ctx,
@@ -6030,7 +6047,7 @@ def proofread_split_events(
         ]
         request = LLMBatchRequest(
             [
-                make_pair_item(
+                make_proofread_item(
                     item_offset + idx + 1,
                     ctx,
                     event.en,
